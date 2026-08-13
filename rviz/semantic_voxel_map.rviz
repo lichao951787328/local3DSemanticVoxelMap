@@ -1,0 +1,53 @@
+Panels:
+  - Class: rviz/Displays
+  - Class: rviz/Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Plane: XY
+      Cell Size: 1
+    - Class: rviz/Marker
+      Name: Semantic Voxels
+      Enabled: true
+      Marker Topic: /local_3d_semantic_voxel_map/semantic_voxels
+      Queue Size: 1
+    - Class: rviz/Marker
+      Name: Traversability Voxels
+      Enabled: false
+      Marker Topic: /local_3d_semantic_voxel_map/traversability_voxels
+      Queue Size: 1
+    - Class: rviz/PointCloud2
+      Name: Voxel Data
+      Enabled: false
+      Topic: /local_3d_semantic_voxel_map/voxel_cloud
+      Queue Size: 1
+      Style: Squares
+      Size (m): 0.1
+      Color Transformer: RGB8
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 15
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 1
+      Pitch: 0.6
+      Target Frame: base_link
+      Yaw: 0.8
+Window Geometry:
+  Height: 800
+  Width: 1200

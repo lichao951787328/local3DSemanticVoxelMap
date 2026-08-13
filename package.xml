@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>local3d_semantic_voxel_map</name>
+  <version>0.1.0</version>
+  <description>Sparse local 3D voxel map with semantic evidence and traversability cost fusion.</description>
+
+  <maintainer email="yanaibo@todo.todo">yanaibo</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>geometry_msgs</depend>
+  <depend>roscpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_sensor_msgs</depend>
+  <depend>visualization_msgs</depend>
+
+  <test_depend>rostest</test_depend>
+
+  <export/>
+</package>

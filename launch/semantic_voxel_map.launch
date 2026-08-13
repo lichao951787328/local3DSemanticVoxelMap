@@ -1,0 +1,15 @@
+<launch>
+  <arg name="config" default="$(find local3d_semantic_voxel_map)/config/semantic_voxel_map.yaml"/>
+  <arg name="rviz" default="false"/>
+
+  <node pkg="local3d_semantic_voxel_map"
+        type="local_3d_semantic_voxel_map_node"
+        name="local_3d_semantic_voxel_map"
+        output="screen"
+        required="true">
+    <rosparam command="load" file="$(arg config)"/>
+  </node>
+
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="semantic_voxel_rviz"
+        args="-d $(find local3d_semantic_voxel_map)/rviz/semantic_voxel_map.rviz"/>
+</launch>

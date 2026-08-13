@@ -1,0 +1,53 @@
+# Input and coordinate frame
+input_topic: /semantic_pcl/semantic_pcl
+global_frame: world
+semantic_field: semantic_color       # SSMI packed RGB stored as FLOAT32 bits
+confidence_field: semantic_confidence # optional; default below if absent
+cost_field: traversability           # optional direct cost in [0, 1]
+default_semantic_confidence: 1.0
+transform_timeout: 0.2
+
+# SSMI publishes the 640x480 image as a flattened 307200-point cloud. With the
+# stride below, sample 213x160 = 34080 pixels before transforming points.
+input_image_width: 640
+input_image_height: 480
+pixel_stride_x: 3
+pixel_stride_y: 3
+pixel_offset_x: 2
+pixel_offset_y: 2
+timing_report_frames: 50  # report map-update avg/min/max every N input frames
+
+# Sparse local voxel map
+voxel_size: 0.10
+decay_seconds: 0.5       # current depth stamp - voxel's last-hit depth stamp
+max_voxels: 500000
+max_range: 15.0          # <= 0 disables the input range limit
+min_z: -2.0
+max_z: 4.0
+local_radius: 20.0       # <= 0 disables spatial pruning
+
+# SSMI-inspired Top-3 semantic evidence fusion
+semantic_positive_update: 1.0
+semantic_negative_update: -0.1
+semantic_min_log_evidence: -4.59512
+semantic_max_log_evidence: 4.59512
+semantic_new_class_prior: 0.8
+
+# Traversability: 0 is easy/safe, 1 is impassable/dangerous.
+unknown_cost: 0.50
+semantic_cost_weight: 0.80
+cost_rise_alpha: 0.65
+cost_fall_alpha: 0.15
+
+# `label` accepts an integer or a quoted hexadecimal packed RGB value.
+# Replace/extend these entries with the palette used by your segmentation net.
+semantic_classes:
+  - {label: "0x000000", name: floor_or_background, color: [80, 180, 80], cost: 0.05}
+  - {label: "0x808080", name: structure,           color: [128, 128, 128], cost: 0.95}
+  - {label: "0x0000ff", name: low_obstacle,        color: [0, 0, 255],     cost: 0.85}
+  - {label: "0xff00ff", name: dynamic_obstacle,    color: [255, 0, 255],   cost: 1.00}
+
+# RViz and persistence
+publish_rate: 10.0
+marker_alpha: 0.85
+map_file: /tmp/local3d_semantic_voxel_map.csv
