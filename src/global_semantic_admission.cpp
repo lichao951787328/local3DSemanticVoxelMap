@@ -39,13 +39,28 @@ AdmissionPoint aggregatePoint(const FrameAggregate& aggregate,
 
 }  // namespace
 
+LocalAdmissionDecision classifyLocalAdmissionVoxel(
+  const std::uint32_t label, const bool exclude_dynamic)
+{
+  const bool dynamic = label >= 11u && label <= 18u;
+  if (exclude_dynamic && dynamic)
+  {
+    return LocalAdmissionDecision::RejectedDynamic;
+  }
+  return LocalAdmissionDecision::Admitted;
+}
+
 GlobalSemanticAdmission::GlobalSemanticAdmission(const GlobalAdmissionConfig& config)
   : config_(config)
 {
   if (config_.voxel_size <= 0.0 || config_.minimum_frames == 0u ||
       config_.minimum_duration < 0.0 || config_.minimum_pose_buckets == 0u ||
       config_.pose_bucket_size <= 0.0 || config_.minimum_robot_baseline < 0.0 ||
-      config_.maximum_position_stddev < 0.0 || config_.candidate_timeout < 0.0)
+      config_.maximum_position_stddev < 0.0 || config_.candidate_timeout < 0.0 ||
+      config_.revocation_minimum_frames == 0u ||
+      config_.revocation_minimum_duration < 0.0 ||
+      config_.revocation_free_max_traversability < 0.0f ||
+      config_.revocation_free_max_traversability > 1.0f)
   {
     throw std::invalid_argument("invalid global semantic admission configuration");
   }
@@ -147,11 +162,24 @@ bool GlobalSemanticAdmission::ready(const Candidate& candidate) const
          candidateStddev(candidate) <= config_.maximum_position_stddev;
 }
 
+bool GlobalSemanticAdmission::revocationReady(
+  const RevocationCandidate& candidate) const
+{
+  return candidate.frame_count >= config_.revocation_minimum_frames &&
+         (candidate.last_seen - candidate.first_seen).toSec() >=
+           config_.revocation_minimum_duration;
+}
+
 AdmissionFrameResult GlobalSemanticAdmission::processFrame(
   const std::vector<AdmissionObservation>& observations,
   const double robot_x, const double robot_y, const ros::Time& stamp)
 {
   AdmissionFrameResult result;
+  if (latest_frame_stamp_.isZero() || stamp != latest_frame_stamp_)
+  {
+    ++frame_sequence_;
+    latest_frame_stamp_ = stamp;
+  }
   std::unordered_map<VoxelKey, FrameAggregate, VoxelKeyHash> eligible;
   std::unordered_map<VoxelKey, FrameAggregate, VoxelKeyHash> rejected_dynamic;
   std::unordered_map<VoxelKey, FrameAggregate, VoxelKeyHash> rejected_unknown;
@@ -211,6 +239,116 @@ AdmissionFrameResult GlobalSemanticAdmission::processFrame(
   appendAggregates(rejected_dynamic, result.rejected_dynamic);
   appendAggregates(rejected_unknown, result.rejected_unknown);
   appendAggregates(rejected_rear, result.rejected_rear);
+
+  std::unordered_set<VoxelKey, VoxelKeyHash> eligible_evidence_keys;
+  auto updateRevocation = [&](const VoxelKey& key,
+                              const AdmissionPoint& evidence,
+                              const RevocationReason reason)
+  {
+    const auto admitted = admitted_.find(key);
+    if (admitted == admitted_.end() || !admitted->second.stability_confirmed)
+    {
+      return;
+    }
+
+    RevocationCandidate& candidate = revocation_candidates_[key];
+    if (candidate.frame_count != 0u && candidate.last_seen == stamp)
+    {
+      // A timer repeat or duplicate delivery is still the same acquisition
+      // frame and must neither advance nor break reverse evidence.
+      return;
+    }
+    const bool consecutive = candidate.frame_count != 0u &&
+      candidate.last_frame_sequence + 1u == frame_sequence_;
+    const bool same_evidence = candidate.frame_count != 0u &&
+      candidate.reason == reason &&
+      (reason == RevocationReason::Free ||
+       candidate.evidence_label == evidence.label);
+    if (!consecutive || !same_evidence)
+    {
+      candidate = RevocationCandidate();
+      candidate.reason = reason;
+      candidate.evidence_label = evidence.label;
+      candidate.first_seen = stamp;
+    }
+    candidate.last_seen = stamp;
+    candidate.last_frame_sequence = frame_sequence_;
+    candidate.evidence_label = evidence.label;
+    candidate.evidence_traversability = evidence.traversability;
+    ++candidate.frame_count;
+
+    if (!revocationReady(candidate))
+    {
+      return;
+    }
+
+    AdmissionPoint revoked = admitted->second.point;
+    revoked.label = candidate.evidence_label;
+    revoked.traversability = candidate.evidence_traversability;
+    if (reason == RevocationReason::Free)
+    {
+      result.revoked_free.push_back(revoked);
+    }
+    else
+    {
+      result.revoked_reclassified.push_back(revoked);
+    }
+    admitted_.erase(admitted);
+    candidates_.erase(key);
+    revocation_candidates_.erase(key);
+  };
+
+  // Explicit terrain/free evidence is evaluated from the winning eligible
+  // observation in this exact 0.40 m voxel. A simultaneous static observation
+  // reaffirms occupancy and prevents a dynamic occluder from revoking it.
+  for (const auto& item : eligible)
+  {
+    const auto winning = std::max_element(
+      item.second.label_weights.begin(), item.second.label_weights.end(),
+      [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+    const AdmissionPoint evidence = aggregatePoint(item.second, winning->first);
+    eligible_evidence_keys.insert(item.first);
+    if (isStatic(evidence.label))
+    {
+      revocation_candidates_.erase(item.first);
+    }
+    else if (isTerrain(evidence.label) &&
+             (item.second.cost_weight <= 0.0 ||
+              evidence.traversability <=
+                config_.revocation_free_max_traversability))
+    {
+      updateRevocation(item.first, evidence, RevocationReason::Free);
+    }
+  }
+
+  for (const auto& item : rejected_dynamic)
+  {
+    if (eligible_evidence_keys.count(item.first) != 0u)
+    {
+      continue;
+    }
+    const auto winning = std::max_element(
+      item.second.label_weights.begin(), item.second.label_weights.end(),
+      [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+    updateRevocation(item.first, aggregatePoint(item.second, winning->first),
+                     RevocationReason::Reclassified);
+  }
+
+  // Strict consecutive evidence: an unobserved, cropped, occluded, unknown or
+  // rear-excluded voxel never increments a revocation. It merely prevents an
+  // old partial contradiction from being joined to a later one.
+  for (auto iterator = revocation_candidates_.begin();
+       iterator != revocation_candidates_.end();)
+  {
+    if (iterator->second.last_frame_sequence != frame_sequence_)
+    {
+      iterator = revocation_candidates_.erase(iterator);
+    }
+    else
+    {
+      ++iterator;
+    }
+  }
 
   for (auto iterator = candidates_.begin(); iterator != candidates_.end();)
   {
@@ -286,6 +424,19 @@ AdmissionFrameResult GlobalSemanticAdmission::processFrame(
   {
     result.candidates.push_back(candidatePoint(item.second));
   }
+  result.revocation_candidates.reserve(revocation_candidates_.size());
+  for (const auto& item : revocation_candidates_)
+  {
+    const auto admitted = admitted_.find(item.first);
+    if (admitted == admitted_.end())
+    {
+      continue;
+    }
+    AdmissionPoint point = admitted->second.point;
+    point.label = item.second.evidence_label;
+    point.traversability = item.second.evidence_traversability;
+    result.revocation_candidates.push_back(point);
+  }
   result.confirmed = admitted();
   return result;
 }
@@ -294,6 +445,9 @@ void GlobalSemanticAdmission::clear()
 {
   candidates_.clear();
   admitted_.clear();
+  revocation_candidates_.clear();
+  frame_sequence_ = 0u;
+  latest_frame_stamp_ = ros::Time();
 }
 
 std::vector<AdmissionPoint> GlobalSemanticAdmission::admitted() const

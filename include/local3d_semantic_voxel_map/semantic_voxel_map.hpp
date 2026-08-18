@@ -123,6 +123,22 @@ struct TraversabilityColumnSnapshot
   float traversability_cost = 0.5f;
 };
 
+struct TerrainHeightCostConfig
+{
+  bool enabled = false;
+  double height_difference_threshold = 0.15;
+  double neighborhood_radius = 0.20;
+  float obstacle_cost = 1.0f;
+  bool only_without_measured_traversability = true;
+};
+
+std::size_t applyTerrainHeightDiscontinuityCost(
+  std::vector<VoxelSnapshot>& voxels, double voxel_size,
+  const TerrainHeightCostConfig& config);
+
+std::vector<TraversabilityColumnSnapshot> projectTraversabilityColumns(
+  const std::vector<VoxelSnapshot>& voxels);
+
 class SemanticVoxelMap
 {
 public:

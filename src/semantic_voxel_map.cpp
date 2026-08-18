@@ -342,6 +342,167 @@ SemanticVoxelMap::traversabilityColumns() const
   return output;
 }
 
+std::size_t applyTerrainHeightDiscontinuityCost(
+  std::vector<VoxelSnapshot>& voxels, const double voxel_size,
+  const TerrainHeightCostConfig& config)
+{
+  if (!config.enabled || voxel_size <= 0.0 ||
+      config.height_difference_threshold < 0.0 ||
+      config.neighborhood_radius < 0.0)
+  {
+    return 0u;
+  }
+
+  struct TerrainColumn
+  {
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    double minimum_z = std::numeric_limits<double>::max();
+    double maximum_z = -std::numeric_limits<double>::max();
+    std::vector<std::size_t> voxel_indices;
+  };
+
+  const auto column_key = [](const std::int32_t x, const std::int32_t y)
+  {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32u) |
+           static_cast<std::uint32_t>(y);
+  };
+  const auto is_terrain = [](const std::uint32_t label)
+  {
+    return label == 0u || label == 1u || label == 9u;
+  };
+
+  std::unordered_map<std::uint64_t, TerrainColumn> columns;
+  columns.reserve(voxels.size());
+  for (std::size_t index = 0u; index < voxels.size(); ++index)
+  {
+    const VoxelSnapshot& voxel = voxels[index];
+    if (!is_terrain(voxel.label) ||
+        (config.only_without_measured_traversability &&
+         voxel.has_measured_traversability))
+    {
+      continue;
+    }
+    TerrainColumn& column = columns[column_key(voxel.key.x, voxel.key.y)];
+    column.x = voxel.key.x;
+    column.y = voxel.key.y;
+    column.minimum_z = std::min(column.minimum_z, voxel.z);
+    column.maximum_z = std::max(column.maximum_z, voxel.z);
+    column.voxel_indices.push_back(index);
+  }
+
+  std::vector<bool> discontinuity(voxels.size(), false);
+  const auto mark_column = [&discontinuity](const TerrainColumn& column)
+  {
+    for (const std::size_t index : column.voxel_indices)
+    {
+      discontinuity[index] = true;
+    }
+  };
+  const double threshold = config.height_difference_threshold;
+  for (const auto& item : columns)
+  {
+    const TerrainColumn& column = item.second;
+    if (column.maximum_z - column.minimum_z > threshold)
+    {
+      mark_column(column);
+    }
+  }
+
+  const int cell_radius = static_cast<int>(
+    std::ceil(config.neighborhood_radius / voxel_size));
+  const double radius_squared =
+    config.neighborhood_radius * config.neighborhood_radius + 1e-12;
+  for (const auto& item : columns)
+  {
+    const TerrainColumn& column = item.second;
+    for (int delta_x = -cell_radius; delta_x <= cell_radius; ++delta_x)
+    {
+      for (int delta_y = -cell_radius; delta_y <= cell_radius; ++delta_y)
+      {
+        // Compare every pair once and never compare a column with itself.
+        if (delta_x < 0 || (delta_x == 0 && delta_y <= 0))
+        {
+          continue;
+        }
+        const double planar_distance_squared = voxel_size * voxel_size *
+          static_cast<double>(delta_x * delta_x + delta_y * delta_y);
+        if (planar_distance_squared > radius_squared)
+        {
+          continue;
+        }
+        const auto neighbor = columns.find(column_key(
+          column.x + delta_x, column.y + delta_y));
+        if (neighbor == columns.end())
+        {
+          continue;
+        }
+        const TerrainColumn& other = neighbor->second;
+        const double maximum_separation = std::max(
+          std::abs(column.maximum_z - other.minimum_z),
+          std::abs(other.maximum_z - column.minimum_z));
+        if (maximum_separation > threshold)
+        {
+          mark_column(column);
+          mark_column(other);
+        }
+      }
+    }
+  }
+
+  std::size_t changed = 0u;
+  for (std::size_t index = 0u; index < voxels.size(); ++index)
+  {
+    if (discontinuity[index] &&
+        voxels[index].traversability_cost < config.obstacle_cost)
+    {
+      voxels[index].traversability_cost = config.obstacle_cost;
+      ++changed;
+    }
+  }
+  return changed;
+}
+
+std::vector<TraversabilityColumnSnapshot> projectTraversabilityColumns(
+  const std::vector<VoxelSnapshot>& voxels)
+{
+  std::unordered_map<std::uint64_t, TraversabilityColumnSnapshot> columns;
+  columns.reserve(voxels.size());
+  for (const VoxelSnapshot& voxel : voxels)
+  {
+    const std::uint64_t key =
+      (static_cast<std::uint64_t>(static_cast<std::uint32_t>(voxel.key.x)) << 32u) |
+      static_cast<std::uint32_t>(voxel.key.y);
+    const auto found = columns.find(key);
+    if (found == columns.end())
+    {
+      TraversabilityColumnSnapshot column;
+      column.x_index = voxel.key.x;
+      column.y_index = voxel.key.y;
+      column.x = voxel.x;
+      column.y = voxel.y;
+      column.z = voxel.z;
+      column.traversability_cost = voxel.traversability_cost;
+      columns.emplace(key, column);
+    }
+    else if (voxel.traversability_cost > found->second.traversability_cost ||
+             (voxel.traversability_cost == found->second.traversability_cost &&
+              voxel.z < found->second.z))
+    {
+      found->second.z = voxel.z;
+      found->second.traversability_cost = voxel.traversability_cost;
+    }
+  }
+
+  std::vector<TraversabilityColumnSnapshot> output;
+  output.reserve(columns.size());
+  for (const auto& item : columns)
+  {
+    output.push_back(item.second);
+  }
+  return output;
+}
+
 float SemanticVoxelMap::classCost(const std::uint32_t label) const
 {
   std::lock_guard<std::mutex> lock(mutex_);

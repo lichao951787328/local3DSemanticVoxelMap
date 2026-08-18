@@ -19,6 +19,7 @@
     <param name="use_initial_pose_reference" value="$(arg use_initial_pose_reference)"/>
     <param name="reference_frame" value="$(arg reference_frame)"/>
     <param name="local_cost_frame" value="$(arg local_cost_frame)"/>
+    <param name="global_admission_output_frame" value="$(arg local_cost_frame)"/>
   </node>
 
   <node if="$(arg rviz)" pkg="rviz" type="rviz" name="semantic_voxel_rviz"

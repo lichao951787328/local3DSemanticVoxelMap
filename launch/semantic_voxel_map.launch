@@ -1,5 +1,9 @@
 <launch>
   <arg name="config" default="$(find local3d_semantic_voxel_map)/config/semantic_voxel_map.yaml"/>
+  <arg name="input_topic" default="/semantic_pcl/semantic_pcl"/>
+  <arg name="global_frame" default="world"/>
+  <arg name="reference_frame" default="map_start"/>
+  <arg name="robot_frame" default="base_link"/>
   <arg name="rviz" default="false"/>
 
   <node pkg="local3d_semantic_voxel_map"
@@ -8,6 +12,10 @@
         output="screen"
         required="true">
     <rosparam command="load" file="$(arg config)"/>
+    <param name="input_topic" value="$(arg input_topic)"/>
+    <param name="global_frame" value="$(arg global_frame)"/>
+    <param name="reference_frame" value="$(arg reference_frame)"/>
+    <param name="global_admission_output_frame" value="$(arg robot_frame)"/>
   </node>
 
   <node if="$(arg rviz)" pkg="rviz" type="rviz" name="semantic_voxel_rviz"

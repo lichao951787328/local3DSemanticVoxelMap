@@ -25,6 +25,9 @@ struct GlobalAdmissionConfig
   double minimum_robot_baseline = 0.5;
   double maximum_position_stddev = 0.18;
   double candidate_timeout = 2.0;
+  std::size_t revocation_minimum_frames = 8u;
+  double revocation_minimum_duration = 1.0;
+  float revocation_free_max_traversability = 0.45f;
 };
 
 struct AdmissionObservation
@@ -56,7 +59,19 @@ struct AdmissionFrameResult
   std::vector<AdmissionPoint> rejected_dynamic;
   std::vector<AdmissionPoint> rejected_unknown;
   std::vector<AdmissionPoint> rejected_rear;
+  std::vector<AdmissionPoint> revocation_candidates;
+  std::vector<AdmissionPoint> revoked_free;
+  std::vector<AdmissionPoint> revoked_reclassified;
 };
+
+enum class LocalAdmissionDecision
+{
+  Admitted,
+  RejectedDynamic
+};
+
+LocalAdmissionDecision classifyLocalAdmissionVoxel(
+  std::uint32_t label, bool exclude_dynamic);
 
 class GlobalSemanticAdmission
 {
@@ -109,12 +124,30 @@ private:
     bool stability_confirmed = false;
   };
 
+  enum class RevocationReason
+  {
+    Free,
+    Reclassified
+  };
+
+  struct RevocationCandidate
+  {
+    RevocationReason reason = RevocationReason::Free;
+    std::uint32_t evidence_label = kInvalidSemanticLabel;
+    ros::Time first_seen;
+    ros::Time last_seen;
+    std::size_t frame_count = 0u;
+    std::size_t last_frame_sequence = 0u;
+    float evidence_traversability = 0.5f;
+  };
+
   VoxelKey keyFor(double x, double y, double z) const;
   PoseBucket poseBucketFor(double x, double y) const;
   AdmissionPoint candidatePoint(const Candidate& candidate) const;
   double candidateStddev(const Candidate& candidate) const;
   double candidateBaseline(const Candidate& candidate) const;
   bool ready(const Candidate& candidate) const;
+  bool revocationReady(const RevocationCandidate& candidate) const;
   static bool isTerrain(std::uint32_t label);
   static bool isStatic(std::uint32_t label);
   static bool isDynamic(std::uint32_t label);
@@ -122,6 +155,10 @@ private:
   GlobalAdmissionConfig config_;
   std::unordered_map<VoxelKey, Candidate, VoxelKeyHash> candidates_;
   std::unordered_map<VoxelKey, AdmittedVoxel, VoxelKeyHash> admitted_;
+  std::unordered_map<VoxelKey, RevocationCandidate, VoxelKeyHash>
+    revocation_candidates_;
+  std::size_t frame_sequence_ = 0u;
+  ros::Time latest_frame_stamp_;
 };
 
 }  // namespace local3d_semantic_voxel_map

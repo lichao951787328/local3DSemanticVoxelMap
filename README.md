@@ -21,6 +21,7 @@ package builds on a standard ROS Noetic installation without OpenVDB.
 The input is `sensor_msgs/PointCloud2` with required fields `x`, `y`, `z` and:
 
 - `semantic_color` (default): SSMI-compatible packed RGB bits in a `FLOAT32`;
+- `semantic_lable`: canonical integer class ID used by recorded `/grids_points`;
 - or `label`: any integer semantic class ID.
 
 Optional fields:
@@ -36,6 +37,25 @@ cloud. This node samples fixed pixels at the configured x/y stride before any
 coordinate transform. The supplied stride-3 configuration processes
 213x160 = 34080 points per frame. This is image-coordinate decimation: no
 semantic label is averaged or created.
+
+### Supported input profiles
+
+The same executable supports both existing data sources. Select one launch
+profile per node instance so their topics and timestamp domains are never mixed:
+
+| Profile | Launch file | Input schema | Label handling | Tracking frame |
+|---|---|---|---|---|
+| Simulation | `semantic_voxel_map.launch` | flattened `semantic_color`, no traversability field | packed RGB is remapped to canonical IDs; terrain height cost is inferred | `world` |
+| Recorded bag/live grid | `grids_points_voxel_map.launch` | unorganized `semantic_lable` plus `traversability` | IDs 0-18 and measured cost pass through | `map` |
+
+The two profiles load independent mappings because their on-wire colors do not
+mean the same thing. The simulation profile maps packed colors such as
+`0x000000 -> 0` (terrain), `0x808080 -> 2` (structure), `0x0000ff -> 3`
+(low obstacle), and `0xff00ff -> 11` (dynamic); the park-path omni profile also
+maps `0x98fb98 -> 9` for grass/stair terrain. The bag profile performs no packed
+color mapping: its integer `semantic_lable` IDs 0-18 are loaded directly with
+the Cityscapes-style class table in `grids_points_voxel_map.yaml`. Each profile's
+class palette independently controls `voxel_cloud.rgb`.
 
 `timing_report_frames` controls map-update timing reports. Each measurement
 starts at entry to the point-cloud callback and ends after that frame's voxel
@@ -62,10 +82,22 @@ The stored cost uses an asymmetric exponential moving average. `cost_rise_alpha`
 is deliberately larger than `cost_fall_alpha`, so a dangerous observation takes
 effect quickly while declaring a voxel safe again requires repeated evidence.
 
+For the simulation profile, which has no traversability field, the published
+snapshot additionally builds a terrain height neighborhood from labels 0, 1 and
+9. Missing-cost terrain columns within 0.20 m are compared; if their height
+difference is greater than 0.15 m, voxels on both sides are raised to cost 1.0.
+This identifies ground/stair boundaries while leaving flat terrain low-cost.
+Voxels that have ever received measured traversability are excluded from this
+geometry inference, so `/grids_points` costs are never overwritten.
+
 ## Run and display
 
 ```bash
+# Packed-RGB simulation cloud
 roslaunch local3d_semantic_voxel_map semantic_voxel_map.launch rviz:=true
+
+# Recorded/live /grids_points cloud
+roslaunch local3d_semantic_voxel_map grids_points_voxel_map.launch rviz:=true
 ```
 
 Published topics:
@@ -74,20 +106,29 @@ Published topics:
 - `~traversability_voxels`: green-yellow-red cost cubes;
 - `~voxel_cloud`: `PointCloud2` with `rgb`, `label`, `semantic_confidence`,
   `traversability`, `intensity`, and `observations` fields.
-- `~global_semantic_admission_grid`: persistent 0.40 m global admission cloud
-  with `x/y/z` (`float32`), `traversability` (`float32`), and the upstream-compatible
-  `semantic_lable` (`uint32`) spelling. Terrain labels 0/1/9 enter directly;
-  static labels 2-8 require multi-frame pose-baseline and position-stability
-  confirmation. Dynamic labels 11-18, unknowns, and the configured rear corridor
-  are excluded from this global output only.
-- `~candidates`, `~confirmed`, `~rejected_dynamic`, `~rejected_unknown`, and
-  `~rejected_rear`: admission debug clouds using the same five-field schema.
+- `~global_semantic_admission_grid`: a filtered view of the same 0.10 m local
+  voxel snapshot, not a persistent global map. It contains `x/y/z` (`float32`),
+  `traversability` (`float32`), and the upstream-compatible `semantic_lable`
+  (`uint32`). Coordinates are frozen in the configured robot frame at the input
+  acquisition time. Every non-dynamic voxel is retained, including ordinary
+  low-cost terrain and static objects. Dynamic labels 11-18 remain in
+  `~voxel_cloud` but are excluded here by default. A semantic-ground stair edge
+  raised by the height rule is still present, but carries high cost so the
+  downstream adapter encodes it as an obstacle while its local label stays 0/1/9.
+- `~confirmed` mirrors the selected local snapshot; `~rejected_dynamic` contains
+  excluded labels 11-18. `~rejected_unknown` and the legacy candidate/rear/
+  revocation debug topics publish empty clouds.
+
+This output has no multi-frame stability state, 0.40 m re-voxelization, rear
+corridor, or permanent admission/revocation state machine. A downstream node may
+accumulate these local observations globally, but that persistence is explicitly
+outside this node.
 
 All map clouds use the last successfully processed input acquisition stamp.
 The publish timer repeats that acquisition-time snapshot and never refreshes
-its header when `/grids_points` stops. This node owns the initial
-`map -> map_start` static transform; do not launch another publisher for that
-child frame.
+its header when the active input stops. This node owns the initial
+`global_frame -> map_start` static transform (`map -> map_start` for the bag
+profile); do not launch another publisher for that child frame.
 
 In RViz, enable one cube topic at a time when the map is large. The point cloud
 can use `RGB8` for semantics or `Intensity` for traversability.

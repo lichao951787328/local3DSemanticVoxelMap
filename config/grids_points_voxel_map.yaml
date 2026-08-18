@@ -9,11 +9,21 @@ use_initial_pose_reference: true
 reference_frame: map_start
 local_cost_frame: wuba_base
 publish_local_cost_cloud: true
+# The filtered admission snapshot is expressed in the robot frame at the input
+# cloud acquisition time. It keeps the local map's native 0.10 m voxel centers.
+global_admission_output_frame: wuba_base
+global_admission_exclude_dynamic: true
+# /grids_points already carries measured traversability; do not replace it with
+# semantic-only terrain geometry inference.
+terrain_height_cost_enabled: false
 input_layout: point_cloud
 point_stride: 1
 
 # Field names are taken from view_point_cloud's registered PCL point type.
 semantic_field: semantic_lable  # Keep the upstream spelling for compatibility.
+# Explicitly clear a packed-RGB remap left on the ROS parameter server when
+# switching from the simulation profile without restarting roscore.
+semantic_label_remap: []
 confidence_field: semantic_confidence  # Optional; defaults to the value below.
 cost_field: traversability
 default_semantic_confidence: 1.0
@@ -41,28 +51,6 @@ local_box_min_y: -10.0
 local_box_max_y: 10.0
 local_box_min_z: -2.0
 local_box_max_z: 4.0
-
-# Global static admission. De-duplicate once per input frame in a separate
-# 0.40 m map_start voxel grid. Labels 0/1/9 enter directly; labels 2-8 must pass
-# every stability gate; dynamic and unknown classes never enter.
-global_admission_voxel_size: 0.40
-global_admission_minimum_frames: 8
-global_admission_minimum_duration: 1.0
-global_admission_minimum_pose_buckets: 3
-global_admission_pose_bucket_size: 0.25
-global_admission_minimum_robot_baseline: 0.5
-global_admission_maximum_position_stddev: 0.18
-global_admission_candidate_timeout: 2.0
-
-# Admission-only rear corridor in the incoming robot/cloud frame. Excluded
-# points remain in voxel_cloud for local obstacle avoidance.
-global_admission_rear_exclusion_enabled: true
-global_admission_rear_min_x: -4.0
-global_admission_rear_max_x: -0.5
-global_admission_rear_min_y: -1.5
-global_admission_rear_max_y: 1.5
-global_admission_rear_min_z: -1.0
-global_admission_rear_max_z: 2.5
 
 # Compact Top-3 semantic evidence.
 semantic_positive_update: 1.0

@@ -17,6 +17,7 @@
 #include <xmlrpcpp/XmlRpcValue.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -234,6 +235,18 @@ public:
     private_nh_.param<std::string>("local_cost_frame", local_cost_frame_,
                                    "wuba_base");
     private_nh_.param("publish_local_cost_cloud", publish_local_cost_cloud_, false);
+    private_nh_.param<std::string>("global_admission_output_frame",
+                                   admission_output_frame_, "");
+    private_nh_.param("global_admission_exclude_dynamic",
+                      admission_exclude_dynamic_, true);
+    private_nh_.param("terrain_height_cost_enabled",
+                      terrain_height_cost_config_.enabled, false);
+    private_nh_.param("terrain_height_difference_threshold",
+                      terrain_height_cost_config_.height_difference_threshold, 0.15);
+    private_nh_.param("terrain_height_neighborhood_radius",
+                      terrain_height_cost_config_.neighborhood_radius, 0.20);
+    private_nh_.param("terrain_height_obstacle_cost",
+                      terrain_height_cost_config_.obstacle_cost, 1.0f);
     private_nh_.param("default_semantic_confidence", default_confidence_, 1.0f);
     private_nh_.param("max_range", max_range_, 15.0);
     private_nh_.param("min_z", min_z_, -std::numeric_limits<double>::max());
@@ -258,47 +271,18 @@ public:
     private_nh_.param<std::string>("input_layout", input_layout_, "image");
     private_nh_.param("point_stride", point_stride_, 1);
     private_nh_.param("timing_report_frames", timing_report_frames_, 50);
-    GlobalAdmissionConfig admission_config;
-    private_nh_.param("global_admission_voxel_size",
-                      admission_config.voxel_size, 0.40);
-    int admission_minimum_frames = 8;
-    private_nh_.param("global_admission_minimum_frames",
-                      admission_minimum_frames, 8);
-    admission_config.minimum_frames = admission_minimum_frames > 0 ?
-      static_cast<std::size_t>(admission_minimum_frames) : 0u;
-    private_nh_.param("global_admission_minimum_duration",
-                      admission_config.minimum_duration, 1.0);
-    int admission_minimum_pose_buckets = 3;
-    private_nh_.param("global_admission_minimum_pose_buckets",
-                      admission_minimum_pose_buckets, 3);
-    admission_config.minimum_pose_buckets = admission_minimum_pose_buckets > 0 ?
-      static_cast<std::size_t>(admission_minimum_pose_buckets) : 0u;
-    private_nh_.param("global_admission_pose_bucket_size",
-                      admission_config.pose_bucket_size, 0.25);
-    private_nh_.param("global_admission_minimum_robot_baseline",
-                      admission_config.minimum_robot_baseline, 0.5);
-    private_nh_.param("global_admission_maximum_position_stddev",
-                      admission_config.maximum_position_stddev, 0.18);
-    private_nh_.param("global_admission_candidate_timeout",
-                      admission_config.candidate_timeout, 2.0);
-    admission_.reset(new GlobalSemanticAdmission(admission_config));
-    private_nh_.param("global_admission_rear_exclusion_enabled",
-                      rear_exclusion_enabled_, true);
-    private_nh_.param("global_admission_rear_min_x", rear_min_x_, -4.0);
-    private_nh_.param("global_admission_rear_max_x", rear_max_x_, -0.5);
-    private_nh_.param("global_admission_rear_min_y", rear_min_y_, -1.5);
-    private_nh_.param("global_admission_rear_max_y", rear_max_y_, 1.5);
-    private_nh_.param("global_admission_rear_min_z", rear_min_z_, -1.0);
-    private_nh_.param("global_admission_rear_max_z", rear_max_z_, 2.5);
     if (input_image_width_ <= 0 || input_image_height_ <= 0 ||
         pixel_stride_x_ <= 0 || pixel_stride_y_ <= 0)
     {
       throw std::runtime_error(
         "input image dimensions and pixel sampling strides must be positive");
     }
-    if (input_layout_ != "image" && input_layout_ != "point_cloud")
+    semantic_label_remap_ = loadSemanticLabelRemap();
+    if (input_layout_ != "image" && input_layout_ != "point_cloud" &&
+        input_layout_ != "auto")
     {
-      throw std::runtime_error("~input_layout must be 'image' or 'point_cloud'");
+      throw std::runtime_error(
+        "~input_layout must be 'image', 'point_cloud', or 'auto'");
     }
     if (point_stride_ <= 0)
     {
@@ -317,12 +301,14 @@ public:
       ROS_WARN("Both local_box_enabled and local_radius are set; the local box "
                "takes precedence");
     }
-    if (rear_exclusion_enabled_ &&
-        (rear_min_x_ >= rear_max_x_ || rear_min_y_ >= rear_max_y_ ||
-         rear_min_z_ >= rear_max_z_))
+    if (terrain_height_cost_config_.height_difference_threshold < 0.0 ||
+        terrain_height_cost_config_.neighborhood_radius < 0.0 ||
+        terrain_height_cost_config_.obstacle_cost < 0.0f ||
+        terrain_height_cost_config_.obstacle_cost > 1.0f)
     {
       throw std::runtime_error(
-        "global admission rear exclusion minimum bounds must be smaller than maximum bounds");
+        "terrain height thresholds/radius must be non-negative and obstacle cost "
+        "must be in [0, 1]");
     }
     if (use_initial_pose_reference_ &&
         (reference_frame_.empty() || reference_frame_ == global_frame_))
@@ -354,6 +340,12 @@ public:
       "rejected_unknown", 1, true);
     rejected_rear_pub_ = private_nh_.advertise<sensor_msgs::PointCloud2>(
       "rejected_rear", 1, true);
+    revocation_candidates_pub_ = private_nh_.advertise<sensor_msgs::PointCloud2>(
+      "revocation_candidates", 1, true);
+    revoked_free_pub_ = private_nh_.advertise<sensor_msgs::PointCloud2>(
+      "revoked_free", 1, true);
+    revoked_reclassified_pub_ = private_nh_.advertise<sensor_msgs::PointCloud2>(
+      "revoked_reclassified", 1, true);
     cloud_sub_ = nh_.subscribe(input_topic_, 1,
                                &SemanticVoxelMapNode::cloudCallback, this);
     reset_service_ = private_nh_.advertiseService(
@@ -385,12 +377,18 @@ public:
                local_box_min_z_, local_box_max_z_,
                max_range_ > 0.0 ? std::to_string(max_range_).c_str() : "disabled");
     }
-    ROS_INFO("Global semantic admission: voxel=%.2f m, rear corridor %s "
-             "x=[%.2f, %.2f], y=[%.2f, %.2f], z=[%.2f, %.2f] in input frame",
-             admission_config.voxel_size,
-             rear_exclusion_enabled_ ? "enabled" : "disabled",
-             rear_min_x_, rear_max_x_, rear_min_y_, rear_max_y_,
-             rear_min_z_, rear_max_z_);
+    ROS_INFO("Local semantic admission filter: output_frame=%s, voxel=%.2f m, "
+             "all non-dynamic voxels are retained, exclude_dynamic=%s",
+             (admission_output_frame_.empty() ? local_cost_frame_ :
+              admission_output_frame_).c_str(),
+             map_->voxelSize(),
+             admission_exclude_dynamic_ ? "true" : "false");
+    ROS_INFO("Missing-cost terrain height inference: %s, dz>%.2f m within "
+             "%.2f m -> cost %.2f (terrain labels 0/1/9 only)",
+             terrain_height_cost_config_.enabled ? "enabled" : "disabled",
+             terrain_height_cost_config_.height_difference_threshold,
+             terrain_height_cost_config_.neighborhood_radius,
+             terrain_height_cost_config_.obstacle_cost);
   }
 
 private:
@@ -462,6 +460,42 @@ private:
     return output;
   }
 
+  std::unordered_map<std::uint32_t, std::uint32_t> loadSemanticLabelRemap()
+  {
+    std::unordered_map<std::uint32_t, std::uint32_t> output;
+    XmlRpc::XmlRpcValue remap;
+    if (!private_nh_.getParam("semantic_label_remap", remap))
+    {
+      return output;
+    }
+    if (remap.getType() != XmlRpc::XmlRpcValue::TypeArray)
+    {
+      throw std::runtime_error("~semantic_label_remap must be a YAML list");
+    }
+    for (int index = 0; index < remap.size(); ++index)
+    {
+      const XmlRpc::XmlRpcValue& item = remap[index];
+      if (item.getType() != XmlRpc::XmlRpcValue::TypeStruct ||
+          !item.hasMember("from") || !item.hasMember("to"))
+      {
+        throw std::runtime_error(
+          "each semantic_label_remap entry requires 'from' and 'to'");
+      }
+      const std::uint32_t source = parseLabel(item["from"]);
+      const std::uint32_t target = parseLabel(item["to"]);
+      const auto insertion = output.emplace(source, target);
+      if (!insertion.second)
+      {
+        throw std::runtime_error(
+          "semantic_label_remap contains duplicate source label " +
+          std::to_string(source));
+      }
+      ROS_INFO("Semantic input label remap: %u (0x%06x) -> %u",
+               source, source & 0x00ffffffu, target);
+    }
+    return output;
+  }
+
   void cloudCallback(const sensor_msgs::PointCloud2ConstPtr& message)
   {
     const ros::WallTime callback_start = ros::WallTime::now();
@@ -477,7 +511,7 @@ private:
         message->header.stamp < latest_processed_frame_stamp_)
     {
       ROS_WARN("Input time rewound from %.6f to %.6f; clearing local map, "
-               "global admission candidates/confirmed voxels, and initial reference",
+               "cached admission snapshot, and initial reference",
                latest_processed_frame_stamp_.toSec(), message->header.stamp.toSec());
       clearRuntimeState(true);
     }
@@ -506,11 +540,34 @@ private:
     const FieldView x_field = findField(*message, "x");
     const FieldView y_field = findField(*message, "y");
     const FieldView z_field = findField(*message, "z");
-    const FieldView semantic = findField(*message, semantic_field_);
+    std::string resolved_semantic_field = semantic_field_;
+    FieldView semantic;
+    if (semantic_field_ == "auto")
+    {
+      const std::array<std::string, 3> candidates{{
+        "semantic_lable", "semantic_color", "label"}};
+      for (const std::string& candidate : candidates)
+      {
+        semantic = findField(*message, candidate);
+        if (semantic.valid)
+        {
+          resolved_semantic_field = candidate;
+          break;
+        }
+      }
+    }
+    else
+    {
+      semantic = findField(*message, semantic_field_);
+    }
     FieldView fallback_label;
-    if (!semantic.valid && semantic_field_ != "label")
+    if (!semantic.valid && resolved_semantic_field != "label")
     {
       fallback_label = findField(*message, "label");
+      if (fallback_label.valid)
+      {
+        resolved_semantic_field = "label";
+      }
     }
     const FieldView confidence = findField(*message, confidence_field_);
     FieldView cost = findField(*message, cost_field_);
@@ -530,8 +587,12 @@ private:
 
     const std::size_t point_count = static_cast<std::size_t>(message->width) *
                                     static_cast<std::size_t>(message->height);
-    const bool image_layout = input_layout_ == "image";
     const bool organized_cloud = message->height > 1u;
+    const bool configured_image_shape = point_count ==
+      static_cast<std::size_t>(input_image_width_) *
+      static_cast<std::size_t>(input_image_height_);
+    const bool image_layout = input_layout_ == "image" ||
+      (input_layout_ == "auto" && (organized_cloud || configured_image_shape));
     const std::uint32_t image_width = organized_cloud ? message->width :
       static_cast<std::uint32_t>(input_image_width_);
     const std::uint32_t image_height = organized_cloud ? message->height :
@@ -585,7 +646,6 @@ private:
     const double max_range_squared = max_range_ > 0.0 ?
       max_range_ * max_range_ : std::numeric_limits<double>::max();
     std::unordered_map<VoxelKey, ScanVoxel, VoxelKeyHash> scan_voxels;
-    std::vector<AdmissionObservation> admission_observations;
     const std::size_t sampled_capacity = image_layout ?
       (image_width + static_cast<std::uint32_t>(pixel_stride_x_) - 1u) /
         static_cast<std::uint32_t>(pixel_stride_x_) *
@@ -594,7 +654,6 @@ private:
       (point_count + static_cast<std::size_t>(point_stride_) - 1u) /
         static_cast<std::size_t>(point_stride_);
     scan_voxels.reserve(sampled_capacity / 2u + 1u);
-    admission_observations.reserve(sampled_capacity);
     std::size_t sampled_points = 0u;
     std::size_t valid_points = 0u;
 
@@ -640,10 +699,19 @@ private:
 
       std::uint32_t label = kInvalidSemanticLabel;
       const FieldView& label_field = semantic.valid ? semantic : fallback_label;
-      const bool packed_float = semantic.valid && semantic_field_ == "semantic_color";
-      const bool valid_semantic =
+      const bool packed_float = semantic.valid &&
+        resolved_semantic_field == "semantic_color";
+      bool valid_semantic =
         readSemanticLabel(point, label_field, packed_float, label) &&
         label != kInvalidSemanticLabel;
+      if (valid_semantic)
+      {
+        const auto remapped = semantic_label_remap_.find(label);
+        if (remapped != semantic_label_remap_.end())
+        {
+          label = remapped->second;
+        }
+      }
 
       double confidence_value = default_confidence_;
       if (confidence.valid)
@@ -660,24 +728,6 @@ private:
       {
         return true;
       }
-
-      AdmissionObservation admission_observation;
-      admission_observation.x = x;
-      admission_observation.y = y;
-      admission_observation.z = z;
-      admission_observation.label = label;
-      admission_observation.has_semantic = valid_semantic && point_confidence > 0.0f;
-      admission_observation.semantic_confidence = point_confidence;
-      admission_observation.has_traversability = valid_cost;
-      admission_observation.traversability = valid_cost ?
-        clampUnit(static_cast<float>(point_cost)) : 0.5f;
-      // This is deliberately admission-only. The observation is still fused
-      // into the 0.10 m local map below, including people behind the robot.
-      admission_observation.rear_excluded = rear_exclusion_enabled_ &&
-        sensor_x >= rear_min_x_ && sensor_x <= rear_max_x_ &&
-        sensor_y >= rear_min_y_ && sensor_y <= rear_max_y_ &&
-        sensor_z >= rear_min_z_ && sensor_z <= rear_max_z_;
-      admission_observations.push_back(admission_observation);
 
       ++valid_points;
       ScanVoxel& aggregated = scan_voxels[map_->worldToKey(x, y, z)];
@@ -780,9 +830,7 @@ private:
       map_->pruneOutside(origin_x, origin_y, origin_z, local_radius_);
     }
 
-    latest_admission_result_ = admission_->processFrame(
-      admission_observations, origin_x, origin_y, message->header.stamp);
-    // Commit the acquisition time only after every local/global operation for
+    // Commit the acquisition time only after the complete local-map update for
     // the frame succeeded. All timer publications reuse exactly this stamp.
     latest_processed_frame_stamp_ = message->header.stamp;
     // End the measurement at completion of this frame's map update. Publishing
@@ -844,9 +892,17 @@ private:
       return;
     }
 
-    const std::vector<VoxelSnapshot> voxels = map_->snapshot();
+    std::vector<VoxelSnapshot> voxels = map_->snapshot();
+    const std::size_t derived_height_obstacles =
+      applyTerrainHeightDiscontinuityCost(
+        voxels, map_->voxelSize(), terrain_height_cost_config_);
     const std::vector<TraversabilityColumnSnapshot> cost_columns =
-      map_->traversabilityColumns();
+      projectTraversabilityColumns(voxels);
+    if (commit_voxel_snapshot && derived_height_obstacles > 0u)
+    {
+      ROS_DEBUG("Raised %zu missing-cost terrain voxels for height discontinuities",
+                derived_height_obstacles);
+    }
     visualization_msgs::Marker semantic_marker;
     semantic_marker.header.frame_id = mapFrame();
     semantic_marker.header.stamp = stamp;
@@ -964,14 +1020,15 @@ private:
     }
     cloud_pub_.publish(cloud);
     publishTraversabilityCostClouds(cost_columns, stamp);
-    publishAdmissionClouds(stamp);
+    publishAdmissionClouds(voxels, stamp, commit_voxel_snapshot);
   }
 
   sensor_msgs::PointCloud2 makeAdmissionCloud(
-    const std::vector<AdmissionPoint>& points, const ros::Time& stamp) const
+    const std::vector<AdmissionPoint>& points, const std::string& frame_id,
+    const ros::Time& stamp) const
   {
     sensor_msgs::PointCloud2 cloud;
-    cloud.header.frame_id = mapFrame();
+    cloud.header.frame_id = frame_id;
     cloud.header.stamp = stamp;
     sensor_msgs::PointCloud2Modifier modifier(cloud);
     // Keep this schema byte-for-byte compatible with grid_semantic_adapter_node.
@@ -1006,20 +1063,102 @@ private:
     return cloud;
   }
 
-  void publishAdmissionClouds(const ros::Time& stamp)
+  void updateAdmissionSnapshot(const std::vector<VoxelSnapshot>& voxels,
+                               const ros::Time& stamp)
   {
+    AdmissionFrameResult result;
+    const std::string output_frame = admission_output_frame_.empty() ?
+      local_cost_frame_ : admission_output_frame_;
+    tf2::Transform map_to_output;
+    map_to_output.setIdentity();
+    if (output_frame != mapFrame())
+    {
+      try
+      {
+        // Freeze the robot-relative coordinates at this acquisition time. A
+        // timer publication reuses these values and never queries a newer pose.
+        const geometry_msgs::TransformStamped transform = tf_buffer_.lookupTransform(
+          output_frame, global_frame_, stamp, ros::Duration(transform_timeout_));
+        const tf2::Quaternion rotation(
+          transform.transform.rotation.x, transform.transform.rotation.y,
+          transform.transform.rotation.z, transform.transform.rotation.w);
+        const tf2::Vector3 translation(
+          transform.transform.translation.x, transform.transform.translation.y,
+          transform.transform.translation.z);
+        map_to_output = tf2::Transform(rotation, translation);
+        if (use_initial_pose_reference_)
+        {
+          map_to_output *= initial_reference_to_global_;
+        }
+      }
+      catch (const tf2::TransformException& exception)
+      {
+        ROS_WARN_THROTTLE(
+          2.0, "Local semantic admission TF error at %.6f (%s <- %s): %s",
+          stamp.toSec(), output_frame.c_str(), mapFrame().c_str(), exception.what());
+        latest_admission_result_ = AdmissionFrameResult();
+        latest_admission_frame_ = output_frame;
+        return;
+      }
+    }
+
+    result.confirmed.reserve(voxels.size());
+    result.rejected_dynamic.reserve(voxels.size() / 8u);
+    result.rejected_unknown.reserve(voxels.size() / 2u);
+    for (const VoxelSnapshot& voxel : voxels)
+    {
+      AdmissionPoint point;
+      const tf2::Vector3 output_point = map_to_output *
+        tf2::Vector3(voxel.x, voxel.y, voxel.z);
+      point.x = output_point.x();
+      point.y = output_point.y();
+      point.z = output_point.z();
+      point.traversability = voxel.traversability_cost;
+      point.label = voxel.label;
+
+      const LocalAdmissionDecision decision = classifyLocalAdmissionVoxel(
+        voxel.label, admission_exclude_dynamic_);
+      if (decision == LocalAdmissionDecision::RejectedDynamic)
+      {
+        result.rejected_dynamic.push_back(point);
+        continue;
+      }
+      result.confirmed.push_back(point);
+    }
+    latest_admission_result_ = std::move(result);
+    latest_admission_frame_ = output_frame;
+  }
+
+  void publishAdmissionClouds(const std::vector<VoxelSnapshot>& voxels,
+                              const ros::Time& stamp,
+                              const bool commit_voxel_snapshot)
+  {
+    if (commit_voxel_snapshot)
+    {
+      updateAdmissionSnapshot(voxels, stamp);
+    }
+    const std::string& frame_id = latest_admission_frame_.empty() ?
+      mapFrame() : latest_admission_frame_;
     global_admission_pub_.publish(
-      makeAdmissionCloud(latest_admission_result_.confirmed, stamp));
+      makeAdmissionCloud(latest_admission_result_.confirmed, frame_id, stamp));
     candidates_pub_.publish(
-      makeAdmissionCloud(latest_admission_result_.candidates, stamp));
+      makeAdmissionCloud(latest_admission_result_.candidates, frame_id, stamp));
     confirmed_pub_.publish(
-      makeAdmissionCloud(latest_admission_result_.confirmed, stamp));
+      makeAdmissionCloud(latest_admission_result_.confirmed, frame_id, stamp));
     rejected_dynamic_pub_.publish(
-      makeAdmissionCloud(latest_admission_result_.rejected_dynamic, stamp));
+      makeAdmissionCloud(latest_admission_result_.rejected_dynamic, frame_id, stamp));
     rejected_unknown_pub_.publish(
-      makeAdmissionCloud(latest_admission_result_.rejected_unknown, stamp));
+      makeAdmissionCloud(latest_admission_result_.rejected_unknown, frame_id, stamp));
     rejected_rear_pub_.publish(
-      makeAdmissionCloud(latest_admission_result_.rejected_rear, stamp));
+      makeAdmissionCloud(latest_admission_result_.rejected_rear, frame_id, stamp));
+    revocation_candidates_pub_.publish(
+      makeAdmissionCloud(
+        latest_admission_result_.revocation_candidates, frame_id, stamp));
+    revoked_free_pub_.publish(
+      makeAdmissionCloud(latest_admission_result_.revoked_free, frame_id, stamp));
+    revoked_reclassified_pub_.publish(
+      makeAdmissionCloud(
+        latest_admission_result_.revoked_reclassified, frame_id, stamp));
   }
 
   sensor_msgs::PointCloud2 makeTraversabilityCostCloud(
@@ -1132,19 +1271,18 @@ private:
   bool resetCallback(std_srvs::Empty::Request&, std_srvs::Empty::Response&)
   {
     // Preserve the already-published map -> map_start reference across a map
-    // reset. Re-parenting map_start would invalidate every global admission
-    // coordinate accumulated by downstream nodes.
+    // reset. Re-parenting map_start would invalidate downstream coordinates.
     clearRuntimeState(false);
     publish(ros::Time(), true);
-    ROS_INFO("Semantic voxel map and global semantic admission state reset");
+    ROS_INFO("Semantic voxel map and cached local admission snapshot reset");
     return true;
   }
 
   void clearRuntimeState(const bool clear_reference)
   {
     map_->clear();
-    admission_->clear();
     latest_admission_result_ = AdmissionFrameResult();
+    latest_admission_frame_.clear();
     latest_processed_frame_stamp_ = ros::Time();
     {
       std::lock_guard<std::mutex> snapshot_lock(snapshot_mutex_);
@@ -1184,7 +1322,6 @@ private:
   tf2_ros::TransformListener tf_listener_;
   tf2_ros::StaticTransformBroadcaster reference_tf_broadcaster_;
   std::unique_ptr<SemanticVoxelMap> map_;
-  std::unique_ptr<GlobalSemanticAdmission> admission_;
   ros::Subscriber cloud_sub_;
   ros::Publisher semantic_marker_pub_;
   ros::Publisher cost_marker_pub_;
@@ -1197,6 +1334,9 @@ private:
   ros::Publisher rejected_dynamic_pub_;
   ros::Publisher rejected_unknown_pub_;
   ros::Publisher rejected_rear_pub_;
+  ros::Publisher revocation_candidates_pub_;
+  ros::Publisher revoked_free_pub_;
+  ros::Publisher revoked_reclassified_pub_;
   ros::ServiceServer reset_service_;
   ros::ServiceServer save_service_;
   ros::ServiceServer load_service_;
@@ -1210,9 +1350,14 @@ private:
   std::string cost_field_;
   std::string map_file_;
   std::string local_cost_frame_ = "wuba_base";
+  std::string admission_output_frame_;
+  std::string latest_admission_frame_;
   std::string input_layout_ = "image";
+  std::unordered_map<std::uint32_t, std::uint32_t> semantic_label_remap_;
   bool publish_local_cost_cloud_ = false;
   bool use_initial_pose_reference_ = false;
+  bool admission_exclude_dynamic_ = true;
+  TerrainHeightCostConfig terrain_height_cost_config_;
   float default_confidence_ = 1.0f;
   double max_range_ = 15.0;
   double min_z_ = -std::numeric_limits<double>::max();
@@ -1236,13 +1381,6 @@ private:
   int pixel_offset_y_ = 2;
   int point_stride_ = 1;
   int timing_report_frames_ = 50;
-  bool rear_exclusion_enabled_ = true;
-  double rear_min_x_ = -4.0;
-  double rear_max_x_ = -0.5;
-  double rear_min_y_ = -1.5;
-  double rear_max_y_ = 1.5;
-  double rear_min_z_ = -1.0;
-  double rear_max_z_ = 2.5;
   ros::Time latest_processed_frame_stamp_;
   ros::Time initial_reference_stamp_;
   tf2::Transform initial_reference_to_global_;

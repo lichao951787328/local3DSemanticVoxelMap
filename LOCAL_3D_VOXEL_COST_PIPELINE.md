@@ -1,8 +1,8 @@
 # 局部三维语义 Voxel 地图、代价计算与发布流程
 
-本文档说明 `local3d_semantic_voxel_map` 当前代码中，从 `/grids_points`
-输入到局部三维 voxel 融合、通行代价计算、代价点云发布，以及测试局部终点和
-FAR `localPlanner` 使用这些结果的完整流程。
+本文档说明 `local3d_semantic_voxel_map` 当前代码中，从仿真 packed-RGB 点云或
+`/grids_points` 输入到局部三维 voxel 融合、通行代价计算、局部非动态筛选、代价点云
+发布，以及测试局部终点和 FAR `localPlanner` 使用这些结果的完整流程。
 
 文档对应的主要文件如下：
 
@@ -25,6 +25,8 @@ flowchart LR
     E --> F["跨帧融合<br/>Top-3 语义 + 非对称代价 EMA"]
     F --> G["3D 稀疏 voxel 地图<br/>时间衰减 + 滚动长方体清理"]
     G --> H["完整 3D 可视化输出"]
+    G --> O["0.10 m 局部筛选<br/>保留全部非动态 voxel"]
+    O --> P["采集时刻机器人 frame<br/>global_semantic_admission_grid"]
     G --> I["按 x-y 柱压缩<br/>每柱保留最高代价"]
     I --> J["map 代价云<br/>供 FAR localPlanner"]
     I --> K["wuba_base 代价云<br/>供局部终点生成器"]
@@ -74,6 +76,19 @@ T_map_start_wuba(t) = inverse(T_map_wuba(t0)) * T_map_wuba(t)
 
 ## 3. 输入点云及必要字段
 
+同一个节点可使用两套互不混流的配置：
+
+| 数据源 | 配置/启动文件 | 布局 | 原始语义 | 规范标签 |
+|---|---|---|---|---|
+| 仿真 | `semantic_voxel_map.yaml` / `semantic_voxel_map.launch` | 640x480 展平图像 | `semantic_color(float32 packed RGB)` | 配置映射到 0、2、3、11 |
+| bag/实机 | `grids_points_voxel_map.yaml` / `grids_points_voxel_map.launch` | 非组织点云 | `semantic_lable(uint32)` | 0-18 原样使用 |
+
+仿真颜色在融合前通过 `semantic_label_remap` 统一为当前准入分类：黑色地面映射
+为 0，灰色结构映射为 2，蓝色低障碍映射为 3，紫色动态障碍映射为 11。输出
+`label` 和全局准入语义因此与 bag 数据一致，但 `rgb` 仍按照各自配置的原始调色板
+显示。两套 YAML 还显式清空/关闭对方专属参数，重复切换 launch 时不会受到 ROS
+参数服务器残留值影响。
+
 当前输入为：
 
 ```text
@@ -109,7 +124,7 @@ T_map_start_wuba(t) = inverse(T_map_wuba(t0)) * T_map_wuba(t)
 
 1. `header.stamp == 0`：丢弃整帧；
 2. 时间戳等于最近成功处理帧：作为重复帧丢弃，不计入静态确认帧数；
-3. 时间戳早于最近成功处理帧：视为时间回退，清空局部地图、全局准入状态和
+3. 时间戳早于最近成功处理帧：视为时间回退，清空局部地图、准入筛选快照和
    初始参考后，以新时间域重新处理该帧；
 4. 使用 `message->header.stamp` 查询
    `global_frame <- message->header.frame_id`；
@@ -126,7 +141,7 @@ T_map_start_wuba(t) = inverse(T_map_wuba(t0)) * T_map_wuba(t)
 当前点云时间 - voxel 最后观测时间 > decay_seconds
 ```
 
-满足条件的 voxel 被删除。当前 `decay_seconds: 1.0`。
+满足条件的 voxel 被删除。当前 `decay_seconds: 0.5`。
 
 这是传感器时间衰减，不是墙上时间衰减。点云停止时，衰减时钟也停止；回放 bag
 暂停不会使地图继续消失。
@@ -135,7 +150,7 @@ T_map_start_wuba(t) = inverse(T_map_wuba(t0)) * T_map_wuba(t)
 
 - 成功处理一帧后，以该帧 `message->header.stamp` 原子生成并缓存完整
   `voxel_cloud`；
-- `semantic_voxels`、`traversability_voxels`、`voxel_cloud`、全局准入云和
+- `semantic_voxels`、`traversability_voxels`、`voxel_cloud`、局部准入筛选云和
   代价云都使用 `latest_processed_frame_stamp_`；
 - `publish_rate` 定时器只重发同一采集时刻快照，不刷新 header，也不推进衰减；
 - `map -> wuba_base` 到 `wuba_base` 的变换也严格查询这个同一时刻；
@@ -296,6 +311,28 @@ C_final = C_measured
 
 `semantic_cost_weight` 只在 `weighted_average` 模式下生效。
 
+### 9.1 仿真语义云的地形高度代价补偿
+
+`/semantic_pcl/semantic_pcl` 只有 `x/y/z/semantic_color`，没有上游
+`traversability`。对这一路输入，节点在生成同一帧发布快照时，从地形标签 `0/1/9`
+建立局部 x-y 高度柱，并比较同一柱及附近地形柱的高度范围。默认规则为：
+
+```yaml
+terrain_height_cost_enabled: true
+terrain_height_difference_threshold: 0.15
+terrain_height_neighborhood_radius: 0.20
+terrain_height_obstacle_cost: 1.0
+```
+
+邻近地形高度差严格大于 0.15 m 时，突变两侧的地形 voxel 都提升为代价 1.0。
+0.20 m 搜索半径用于跨过深度边缘过滤留下的窄空洞。这样楼梯踏面和普通地面即使
+语义上都属于可通行地形，其交界/立面仍会作为几何障碍进入局部代价云和 admission
+筛选输出，而平坦地面保持低代价。
+
+这一步只修改发布快照中的最终 `traversability`，不伪造
+`measured_traversability`，也不修改语义 `label`。带有实测代价的 voxel 一律不参加
+高度推断；因此 `/grids_points` 配置显式关闭该功能并完整使用 bag 中的实测值。
+
 ## 10. 地图维护
 
 地图同时通过三种机制限制规模：
@@ -337,12 +374,11 @@ x, y, z, intensity
 | `/local_3d_semantic_voxel_map/semantic_voxels` | `visualization_msgs/Marker` | `map_start` | 完整 3D voxel，按语义类别着色 |
 | `/local_3d_semantic_voxel_map/traversability_voxels` | `visualization_msgs/Marker` | `map_start` | 完整 3D voxel，绿-黄-红代价着色 |
 | `/local_3d_semantic_voxel_map/voxel_cloud` | `sensor_msgs/PointCloud2` | `map_start` | 完整 3D 融合结果及所有语义/代价字段 |
-| `/local_3d_semantic_voxel_map/global_semantic_admission_grid` | `sensor_msgs/PointCloud2` | `map_start` | 0.40 m 全局静态准入结果，字段兼容 `/grids_points` |
-| `/local_3d_semantic_voxel_map/candidates` | `sensor_msgs/PointCloud2` | `map_start` | 尚未通过全部稳定性门槛的静态候选 |
-| `/local_3d_semantic_voxel_map/confirmed` | `sensor_msgs/PointCloud2` | `map_start` | 已准入的地形与确认静态点 |
-| `/local_3d_semantic_voxel_map/rejected_dynamic` | `sensor_msgs/PointCloud2` | `map_start` | 本帧动态标签拒绝点 |
-| `/local_3d_semantic_voxel_map/rejected_unknown` | `sensor_msgs/PointCloud2` | `map_start` | 本帧未知/非准入标签拒绝点 |
-| `/local_3d_semantic_voxel_map/rejected_rear` | `sensor_msgs/PointCloud2` | `map_start` | 本帧后方准入走廊拒绝点；仍保留在局部地图 |
+| `/local_3d_semantic_voxel_map/global_semantic_admission_grid` | `sensor_msgs/PointCloud2` | `wuba_base`（bag）/`base_link`（仿真） | 同一 0.10 m 局部快照剔除动态物体后的结果，字段兼容 `/grids_points` |
+| `/local_3d_semantic_voxel_map/confirmed` | `sensor_msgs/PointCloud2` | 同上 | 与筛选输出相同，便于调试 |
+| `/local_3d_semantic_voxel_map/rejected_dynamic` | `sensor_msgs/PointCloud2` | 同上 | 默认排除但仍保留在完整局部地图的动态标签点 |
+| `/local_3d_semantic_voxel_map/rejected_unknown` | `sensor_msgs/PointCloud2` | 同上 | 当前为空；未知非动态点也会保留 |
+| `candidates/rejected_rear/revocation_*` | `sensor_msgs/PointCloud2` | 同上 | 兼容保留的空调试云；当前筛选器不维护这些状态 |
 | `/local_3d_semantic_voxel_map/traversability_cost_cloud` | `sensor_msgs/PointCloud2` | `map` | 柱压缩后的全局代价云，供 FAR |
 | `/local_3d_semantic_voxel_map/traversability_cost_cloud_wuba` | `sensor_msgs/PointCloud2` | `wuba_base` | 同一代价云在最新点云时刻变换到车体坐标系，供局部终点选择 |
 
@@ -357,22 +393,35 @@ observations, semantic_observations, traversability_observations
 其中 `traversability` 和 `intensity` 都是最终融合代价。若 voxel 从未收到直接测量
 代价，`measured_traversability` 为 `NaN`，用来与真正的 `0.5` 测量值区分。
 
-### 12.1 全局静态准入
+### 12.1 局部非动态筛选
 
-全局准入与 0.10 m 时间衰减局部地图相互独立：标签 `0/1/9` 可直接进入；明确
-静态标签 `2-8` 在全局 0.40 m voxel 内按帧去重，并要求至少 8 个不同帧、持续
-1.0 s、3 个机器人位姿桶、0.5 m 机器人基线以及不超过 0.18 m 的三维位置标准差。
-候选超过 2.0 s 未再次观测会删除。标签 `11-18`、未知/其它标签，以及机器人后方
-`x=[-4.0,-0.5], y=[-1.5,1.5], z=[-1.0,2.5]` 走廊中的点不进入全局层。
+尽管为保持接口兼容仍沿用 `global_semantic_admission_grid` 话题名，它现在不是全局
+点云，也不维护独立历史。节点直接遍历本帧已经完成融合、衰减和局部空间裁剪的
+0.10 m voxel 快照，并保留除明确动态标签 `11-18` 之外的全部 voxel。因此普通
+低代价地面、草地/楼梯踏面、静态标签 `2-8` 和未知非动态点都继续输出。动态点仍
+完整保留在 `voxel_cloud` 供局部避障，只从 admission 输出中排除。
 
-后方走廊只影响全局准入。相同点仍照常进入 `voxel_cloud`，因此跟随人员或后方动态
-目标的过滤不会清除局部避障所需的静态、动态和未知高代价障碍。全局输出与五个
-调试云统一使用：
+`traversability` 不再决定某个非动态点是否进入该话题，而是决定其下游用途：普通
+地面保持低代价；仿真中高度突变超过 0.15 m 的地形边界被提升到 1.0，SSMI adapter
+再以 0.75 为障碍阈值将这些高代价点编码为墙体障碍。
+
+筛选点使用该帧采集时间的机器人位姿，从 `map_start` 变换到 `wuba_base`（bag）或
+`base_link`（仿真）。坐标、frame 和 `header.stamp` 一起缓存；定时器重发时不会按
+机器人新位姿重新变换。输出字段为：
 
 ```text
 x(float32), y(float32), z(float32), traversability(float32),
 semantic_lable(uint32)
 ```
+
+### 12.2 与持久化全局地图的边界
+
+当前节点不再执行 8 帧稳定性确认、0.40 m 再体素化、候选超时、后方走廊或反向
+撤销状态机。一个点是否出现在筛选话题中，完全由当前缓存的局部 voxel 快照决定；
+局部衰减或新观测改变快照后，下一帧筛选结果自然随之改变。
+
+如果 SSMI/OctoMap 订阅该话题并长期累计，永久化、自由空间清除及误分类撤销策略
+属于下游全局建图器，不能再把本话题本身理解为“已经稳定确认的永久静态地图”。
 
 ## 13. 测试局部终点生成器
 

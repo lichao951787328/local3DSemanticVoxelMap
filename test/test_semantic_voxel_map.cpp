@@ -38,7 +38,94 @@ bool containsAdmissionLabel(const std::vector<map::AdmissionPoint>& points,
     [label](const map::AdmissionPoint& point) { return point.label == label; });
 }
 
+map::VoxelSnapshot voxelSnapshot(
+  const std::int32_t x, const std::int32_t y, const std::int32_t z,
+  const std::uint32_t label, const float cost = 0.05f,
+  const bool has_measured = false)
+{
+  map::VoxelSnapshot voxel;
+  voxel.key = map::VoxelKey{x, y, z};
+  voxel.x = 0.1 * static_cast<double>(x) + 0.05;
+  voxel.y = 0.1 * static_cast<double>(y) + 0.05;
+  voxel.z = 0.1 * static_cast<double>(z) + 0.05;
+  voxel.label = label;
+  voxel.traversability_cost = cost;
+  voxel.has_measured_traversability = has_measured;
+  voxel.measured_traversability_cost = cost;
+  return voxel;
+}
+
 }  // namespace
+
+TEST(TerrainHeightCost, RaisesBothSidesOfMissingCostTerrainStep)
+{
+  map::TerrainHeightCostConfig config;
+  config.enabled = true;
+  config.height_difference_threshold = 0.15;
+  config.neighborhood_radius = 0.20;
+  config.obstacle_cost = 1.0f;
+  std::vector<map::VoxelSnapshot> voxels{
+    voxelSnapshot(0, 0, 0, 0u),
+    voxelSnapshot(2, 0, 2, 9u)};
+
+  EXPECT_EQ(2u, map::applyTerrainHeightDiscontinuityCost(voxels, 0.10, config));
+  EXPECT_FLOAT_EQ(1.0f, voxels[0].traversability_cost);
+  EXPECT_FLOAT_EQ(1.0f, voxels[1].traversability_cost);
+
+  const auto columns = map::projectTraversabilityColumns(voxels);
+  ASSERT_EQ(2u, columns.size());
+  EXPECT_TRUE(std::all_of(columns.begin(), columns.end(),
+    [](const map::TraversabilityColumnSnapshot& column)
+    {
+      return column.traversability_cost == 1.0f;
+    }));
+}
+
+TEST(TerrainHeightCost, LeavesFlatMeasuredAndNonTerrainVoxelsUnchanged)
+{
+  map::TerrainHeightCostConfig config;
+  config.enabled = true;
+  std::vector<map::VoxelSnapshot> flat{
+    voxelSnapshot(0, 0, 0, 0u),
+    voxelSnapshot(1, 0, 1, 9u)};
+  EXPECT_EQ(0u, map::applyTerrainHeightDiscontinuityCost(flat, 0.10, config));
+
+  std::vector<map::VoxelSnapshot> measured{
+    voxelSnapshot(0, 0, 0, 0u, 0.20f, true),
+    voxelSnapshot(1, 0, 2, 9u)};
+  EXPECT_EQ(0u, map::applyTerrainHeightDiscontinuityCost(measured, 0.10, config));
+  EXPECT_FLOAT_EQ(0.20f, measured[0].traversability_cost);
+  EXPECT_FLOAT_EQ(0.05f, measured[1].traversability_cost);
+
+  std::vector<map::VoxelSnapshot> obstacles{
+    voxelSnapshot(0, 0, 0, 2u),
+    voxelSnapshot(1, 0, 3, 3u)};
+  EXPECT_EQ(0u, map::applyTerrainHeightDiscontinuityCost(obstacles, 0.10, config));
+}
+
+TEST(LocalAdmissionFilter, RetainsAllNonDynamicVoxels)
+{
+  using map::LocalAdmissionDecision;
+  EXPECT_EQ(LocalAdmissionDecision::Admitted,
+            map::classifyLocalAdmissionVoxel(0u, true));
+  EXPECT_EQ(LocalAdmissionDecision::Admitted,
+            map::classifyLocalAdmissionVoxel(9u, true));
+  EXPECT_EQ(LocalAdmissionDecision::Admitted,
+            map::classifyLocalAdmissionVoxel(2u, true));
+  EXPECT_EQ(LocalAdmissionDecision::Admitted,
+            map::classifyLocalAdmissionVoxel(map::kInvalidSemanticLabel, true));
+  EXPECT_EQ(LocalAdmissionDecision::RejectedDynamic,
+            map::classifyLocalAdmissionVoxel(11u, true));
+  EXPECT_EQ(LocalAdmissionDecision::RejectedDynamic,
+            map::classifyLocalAdmissionVoxel(18u, true));
+}
+
+TEST(LocalAdmissionFilter, DynamicExclusionCanBeDisabled)
+{
+  using map::LocalAdmissionDecision;
+  EXPECT_EQ(LocalAdmissionDecision::Admitted,
+            map::classifyLocalAdmissionVoxel(11u, false));
+}
 
 TEST(GlobalSemanticAdmission, OnlyTerrainBypassesStabilityAndRejectsUnsafeClasses)
 {
@@ -142,6 +229,153 @@ TEST(GlobalSemanticAdmission, CandidateTimeoutAndClearDiscardState)
   ASSERT_EQ(1u, admission.admitted().size());
   admission.clear();
   EXPECT_TRUE(admission.admitted().empty());
+}
+
+TEST(GlobalSemanticAdmission, StableDynamicReclassificationRevokesConfirmedStatic)
+{
+  map::GlobalAdmissionConfig config;
+  config.minimum_frames = 1u;
+  config.minimum_duration = 0.0;
+  config.minimum_pose_buckets = 1u;
+  config.minimum_robot_baseline = 0.0;
+  config.revocation_minimum_frames = 3u;
+  config.revocation_minimum_duration = 0.2;
+  map::GlobalSemanticAdmission admission(config);
+
+  ros::Time stamp;
+  stamp.fromSec(50.0);
+  map::AdmissionFrameResult result = admission.processFrame(
+    {admissionObservation(1.0, 0.0, 0.0, 2u)}, 0.0, 0.0, stamp);
+  ASSERT_TRUE(containsAdmissionLabel(result.confirmed, 2u));
+
+  for (int frame = 1; frame <= 3; ++frame)
+  {
+    stamp.fromSec(50.0 + 0.1 * frame);
+    result = admission.processFrame(
+      {admissionObservation(1.0, 0.0, 0.0, 13u)}, 0.0, 0.0, stamp);
+    if (frame == 1)
+    {
+      const map::AdmissionFrameResult duplicate = admission.processFrame(
+        {admissionObservation(1.0, 0.0, 0.0, 13u)}, 0.0, 0.0, stamp);
+      EXPECT_TRUE(duplicate.revoked_reclassified.empty());
+      ASSERT_EQ(1u, duplicate.revocation_candidates.size());
+    }
+    if (frame < 3)
+    {
+      EXPECT_TRUE(containsAdmissionLabel(result.confirmed, 2u));
+      EXPECT_TRUE(result.revoked_reclassified.empty());
+      ASSERT_EQ(1u, result.revocation_candidates.size());
+    }
+  }
+
+  EXPECT_FALSE(containsAdmissionLabel(result.confirmed, 2u));
+  ASSERT_EQ(1u, result.revoked_reclassified.size());
+  EXPECT_EQ(13u, result.revoked_reclassified.front().label);
+}
+
+TEST(GlobalSemanticAdmission, MissingFrameBreaksRevocationButNeverMeansFree)
+{
+  map::GlobalAdmissionConfig config;
+  config.minimum_frames = 1u;
+  config.minimum_duration = 0.0;
+  config.minimum_pose_buckets = 1u;
+  config.minimum_robot_baseline = 0.0;
+  config.revocation_minimum_frames = 2u;
+  config.revocation_minimum_duration = 0.0;
+  map::GlobalSemanticAdmission admission(config);
+
+  ros::Time stamp;
+  stamp.fromSec(60.0);
+  admission.processFrame({admissionObservation(1.0, 0.0, 0.0, 2u)},
+                         0.0, 0.0, stamp);
+  stamp.fromSec(60.1);
+  admission.processFrame({admissionObservation(1.0, 0.0, 0.0, 13u)},
+                         0.0, 0.0, stamp);
+  stamp.fromSec(60.2);
+  map::AdmissionFrameResult result = admission.processFrame({}, 0.0, 0.0, stamp);
+  EXPECT_TRUE(result.revocation_candidates.empty());
+  EXPECT_TRUE(containsAdmissionLabel(result.confirmed, 2u));
+
+  stamp.fromSec(60.3);
+  result = admission.processFrame(
+    {admissionObservation(1.0, 0.0, 0.0, 13u)}, 0.0, 0.0, stamp);
+  EXPECT_TRUE(result.revoked_reclassified.empty());
+  EXPECT_TRUE(containsAdmissionLabel(result.confirmed, 2u));
+}
+
+TEST(GlobalSemanticAdmission, OnlyLowCostTerrainCanRevokeStaticAsFree)
+{
+  map::GlobalAdmissionConfig config;
+  config.minimum_frames = 1u;
+  config.minimum_duration = 0.0;
+  config.minimum_pose_buckets = 1u;
+  config.minimum_robot_baseline = 0.0;
+  config.revocation_minimum_frames = 2u;
+  config.revocation_minimum_duration = 0.1;
+  config.revocation_free_max_traversability = 0.45f;
+  map::GlobalSemanticAdmission admission(config);
+
+  ros::Time stamp;
+  stamp.fromSec(70.0);
+  admission.processFrame({admissionObservation(1.0, 0.0, 0.0, 2u)},
+                         0.0, 0.0, stamp);
+  for (int frame = 1; frame <= 2; ++frame)
+  {
+    stamp.fromSec(70.0 + 0.1 * frame);
+    admission.processFrame({admissionObservation(1.0, 0.0, 0.0, 0u, 0.9f)},
+                           0.0, 0.0, stamp);
+  }
+  EXPECT_TRUE(containsAdmissionLabel(admission.admitted(), 2u));
+
+  map::AdmissionFrameResult result;
+  for (int frame = 3; frame <= 4; ++frame)
+  {
+    stamp.fromSec(70.0 + 0.1 * frame);
+    result = admission.processFrame(
+      {admissionObservation(1.0, 0.0, 0.0, 0u, 0.1f)}, 0.0, 0.0, stamp);
+  }
+  ASSERT_EQ(1u, result.revoked_free.size());
+  EXPECT_EQ(0u, result.revoked_free.front().label);
+  EXPECT_FALSE(containsAdmissionLabel(result.confirmed, 2u));
+  EXPECT_TRUE(containsAdmissionLabel(result.confirmed, 0u));
+}
+
+TEST(GlobalSemanticAdmission, RevokedStaticMustPassFullAdmissionAgain)
+{
+  map::GlobalAdmissionConfig config;
+  config.minimum_frames = 2u;
+  config.minimum_duration = 0.0;
+  config.minimum_pose_buckets = 1u;
+  config.minimum_robot_baseline = 0.0;
+  config.revocation_minimum_frames = 2u;
+  config.revocation_minimum_duration = 0.0;
+  map::GlobalSemanticAdmission admission(config);
+  ros::Time stamp;
+
+  for (int frame = 0; frame < 2; ++frame)
+  {
+    stamp.fromSec(80.0 + 0.1 * frame);
+    admission.processFrame({admissionObservation(1.0, 0.0, 0.0, 2u)},
+                           0.0, 0.0, stamp);
+  }
+  ASSERT_TRUE(containsAdmissionLabel(admission.admitted(), 2u));
+  for (int frame = 2; frame < 4; ++frame)
+  {
+    stamp.fromSec(80.0 + 0.1 * frame);
+    admission.processFrame({admissionObservation(1.0, 0.0, 0.0, 13u)},
+                           0.0, 0.0, stamp);
+  }
+  ASSERT_FALSE(containsAdmissionLabel(admission.admitted(), 2u));
+
+  stamp.fromSec(80.4);
+  map::AdmissionFrameResult result = admission.processFrame(
+    {admissionObservation(1.0, 0.0, 0.0, 2u)}, 0.0, 0.0, stamp);
+  EXPECT_FALSE(containsAdmissionLabel(result.confirmed, 2u));
+  EXPECT_EQ(1u, admission.candidateCount());
+  stamp.fromSec(80.5);
+  result = admission.processFrame(
+    {admissionObservation(1.0, 0.0, 0.0, 2u)}, 0.0, 0.0, stamp);
+  EXPECT_TRUE(containsAdmissionLabel(result.confirmed, 2u));
 }
 
 TEST(SemanticEvidence, RepeatedObservationsWin)

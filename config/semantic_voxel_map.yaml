@@ -1,8 +1,21 @@
 # Input and coordinate frame
 input_topic: /semantic_pcl/semantic_pcl
 global_frame: world
+use_initial_pose_reference: true
+reference_frame: map_start
 publish_local_cost_cloud: false
+# Simulation robot body frame used by the local admission snapshot.
+global_admission_output_frame: base_link
+global_admission_exclude_dynamic: true
+# This source has no traversability field. On terrain labels 0/1/9, mark both
+# sides of a local height discontinuity as obstacles. The 0.20 m neighborhood
+# bridges the narrow invalid band created by the depth-edge filter.
+terrain_height_cost_enabled: true
+terrain_height_difference_threshold: 0.15
+terrain_height_neighborhood_radius: 0.20
+terrain_height_obstacle_cost: 1.0
 input_layout: image
+point_stride: 1
 semantic_field: semantic_color       # SSMI packed RGB stored as FLOAT32 bits
 confidence_field: semantic_confidence # optional; default below if absent
 cost_field: traversability           # optional direct cost in [0, 1]
@@ -27,6 +40,15 @@ max_range: 15.0          # <= 0 disables the input range limit
 min_z: -2.0
 max_z: 4.0
 local_radius: 20.0       # <= 0 disables spatial pruning
+local_box_enabled: false
+
+# The simulation palette is normalized to the same canonical IDs used by the
+# recorded /grids_points pipeline, so local admission has identical label rules.
+semantic_label_remap:
+  - {from: "0x000000", to: 0}   # floor/background -> traversable terrain
+  - {from: "0x808080", to: 2}   # structure -> static candidate
+  - {from: "0x0000ff", to: 3}   # low obstacle -> static candidate
+  - {from: "0xff00ff", to: 11}  # dynamic obstacle -> dynamic
 
 # SSMI-inspired Top-3 semantic evidence fusion
 semantic_positive_update: 1.0
@@ -42,13 +64,13 @@ traversability_fusion_method: weighted_average
 cost_rise_alpha: 0.65
 cost_fall_alpha: 0.15
 
-# `label` accepts an integer or a quoted hexadecimal packed RGB value.
-# Replace/extend these entries with the palette used by your segmentation net.
+# Classes below use canonical IDs after semantic_label_remap while preserving
+# the original simulation colors in voxel_cloud.rgb and RViz.
 semantic_classes:
-  - {label: "0x000000", name: floor_or_background, color: [80, 180, 80], cost: 0.05}
-  - {label: "0x808080", name: structure,           color: [128, 128, 128], cost: 0.95}
-  - {label: "0x0000ff", name: low_obstacle,        color: [0, 0, 255],     cost: 0.85}
-  - {label: "0xff00ff", name: dynamic_obstacle,    color: [255, 0, 255],   cost: 1.00}
+  - {label: 0,  name: floor_or_background, color: [80, 180, 80],    cost: 0.05}
+  - {label: 2,  name: structure,           color: [128, 128, 128],  cost: 0.95}
+  - {label: 3,  name: low_obstacle,        color: [0, 0, 255],      cost: 0.85}
+  - {label: 11, name: dynamic_obstacle,    color: [255, 0, 255],    cost: 1.00}
 
 # RViz and persistence
 publish_rate: 10.0
