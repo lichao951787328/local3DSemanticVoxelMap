@@ -1,0 +1,109 @@
+# Raw grid cloud produced upstream of view_point_cloud.
+input_topic: /grids_points
+# Accumulate in a stable frame. This requires map <- wuba_base TF at each
+# incoming cloud timestamp.
+global_frame: map
+# Capture global_frame <- wuba_base at the first successfully transformed cloud.
+# Voxel storage then uses map_start, where that first robot pose is the origin.
+use_initial_pose_reference: true
+reference_frame: map_start
+local_cost_frame: wuba_base
+publish_local_cost_cloud: true
+input_layout: point_cloud
+point_stride: 1
+
+# Field names are taken from view_point_cloud's registered PCL point type.
+semantic_field: semantic_lable  # Keep the upstream spelling for compatibility.
+confidence_field: semantic_confidence  # Optional; defaults to the value below.
+cost_field: traversability
+default_semantic_confidence: 1.0
+transform_timeout: 0.2
+timing_report_frames: 50
+
+# Sparse local map. /grids_points is already sampled on an approximately 0.1 m grid.
+voxel_size: 0.10
+decay_seconds: 0.5
+max_voxels: 300000
+# Optional spherical sensor outlier filter. <= 0 disables it. The local box
+# below already bounds every accepted point, so it is disabled for this setup.
+max_range: -1.0
+min_z: -2.0
+max_z: 4.0
+# Rolling cuboid in the incoming cloud frame (wuba_base here). It follows both
+# the robot position and orientation. Bounds may be asymmetric to retain more
+# space in front than behind. local_radius remains as a backward-compatible
+# spherical alternative and is ignored while local_box_enabled is true.
+local_radius: -1.0
+local_box_enabled: true
+local_box_min_x: -10.0
+local_box_max_x: 10.0
+local_box_min_y: -10.0
+local_box_max_y: 10.0
+local_box_min_z: -2.0
+local_box_max_z: 4.0
+
+# Global static admission. De-duplicate once per input frame in a separate
+# 0.40 m map_start voxel grid. Labels 0/1/9 enter directly; labels 2-8 must pass
+# every stability gate; dynamic and unknown classes never enter.
+global_admission_voxel_size: 0.40
+global_admission_minimum_frames: 8
+global_admission_minimum_duration: 1.0
+global_admission_minimum_pose_buckets: 3
+global_admission_pose_bucket_size: 0.25
+global_admission_minimum_robot_baseline: 0.5
+global_admission_maximum_position_stddev: 0.18
+global_admission_candidate_timeout: 2.0
+
+# Admission-only rear corridor in the incoming robot/cloud frame. Excluded
+# points remain in voxel_cloud for local obstacle avoidance.
+global_admission_rear_exclusion_enabled: true
+global_admission_rear_min_x: -4.0
+global_admission_rear_max_x: -0.5
+global_admission_rear_min_y: -1.5
+global_admission_rear_max_y: 1.5
+global_admission_rear_min_z: -1.0
+global_admission_rear_max_z: 2.5
+
+# Compact Top-3 semantic evidence.
+semantic_positive_update: 1.0
+semantic_negative_update: -0.1
+semantic_min_log_evidence: -4.59512
+semantic_max_log_evidence: 4.59512
+semantic_new_class_prior: 0.8
+
+# Preserve measured and semantic costs independently. Semantics may only raise
+# geometric risk, scaled by the voxel's semantic confidence:
+# final = measured + alpha * confidence * max(0, semantic - measured).
+unknown_cost: 0.50
+traversability_fusion_method: confidence_weighted_raise
+semantic_risk_alpha: 0.80
+semantic_cost_weight: 0.0  # Used only when fusion method is weighted_average.
+cost_rise_alpha: 0.70
+cost_fall_alpha: 0.15
+
+# Cityscapes-style IDs and colors used in view_point_cloud/src/main.cpp.
+# Costs are navigation policy and can be tuned for the robot, independently of color.
+semantic_classes:
+  - {label: 0,  name: road,          color: [128, 64, 128],  cost: 0.05}
+  - {label: 1,  name: sidewalk,      color: [244, 35, 232],  cost: 0.20}
+  - {label: 2,  name: building,      color: [70, 70, 70],    cost: 1.00}
+  - {label: 3,  name: wall,          color: [102, 102, 156], cost: 1.00}
+  - {label: 4,  name: fence,         color: [190, 153, 153], cost: 1.00}
+  - {label: 5,  name: pole,          color: [153, 153, 153], cost: 1.00}
+  - {label: 6,  name: traffic_light, color: [250, 170, 30],  cost: 1.00}
+  - {label: 7,  name: traffic_sign,  color: [220, 220, 0],   cost: 1.00}
+  - {label: 8,  name: vegetation,    color: [107, 142, 35],  cost: 0.85}
+  - {label: 9,  name: terrain,       color: [152, 251, 152], cost: 0.35}
+  - {label: 10, name: sky,           color: [70, 130, 180],  cost: 1.00}
+  - {label: 11, name: person,        color: [220, 20, 60],   cost: 1.00}
+  - {label: 12, name: rider,         color: [255, 0, 0],     cost: 1.00}
+  - {label: 13, name: car,           color: [0, 0, 142],     cost: 1.00}
+  - {label: 14, name: truck,         color: [0, 0, 70],      cost: 1.00}
+  - {label: 15, name: bus,           color: [0, 60, 100],    cost: 1.00}
+  - {label: 16, name: train,         color: [0, 80, 100],    cost: 1.00}
+  - {label: 17, name: motorcycle,    color: [0, 0, 230],     cost: 1.00}
+  - {label: 18, name: bicycle,       color: [119, 11, 32],   cost: 1.00}
+
+publish_rate: 10.0
+marker_alpha: 0.85
+map_file: /tmp/grids_points_voxel_map.csv

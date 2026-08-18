@@ -5,6 +5,7 @@
 
 #include <ros/time.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -42,6 +43,13 @@ struct SemanticClass
   float traversability_cost = 0.5f;
 };
 
+enum class TraversabilityFusionMethod
+{
+  WeightedAverage,
+  Maximum,
+  ConfidenceWeightedRaise
+};
+
 struct SemanticVoxelMapConfig
 {
   double voxel_size = 0.10;
@@ -49,8 +57,13 @@ struct SemanticVoxelMapConfig
   std::size_t max_voxels = 500000;
   float unknown_cost = 0.5f;
   float semantic_cost_weight = 0.8f;
+  // Strength of the one-way semantic risk correction. The actual correction
+  // is also scaled by the dominant semantic probability of each voxel.
+  float semantic_risk_alpha = 1.0f;
   float cost_rise_alpha = 0.65f;
   float cost_fall_alpha = 0.15f;
+  TraversabilityFusionMethod traversability_fusion_method =
+    TraversabilityFusionMethod::WeightedAverage;
   SemanticFusionConfig semantic_fusion;
 };
 
@@ -71,8 +84,14 @@ struct SemanticVoxel
   }
 
   SemanticEvidence semantics;
+  float semantic_cost = 0.5f;
+  float measured_traversability_cost = 0.5f;
+  bool has_measured_traversability = false;
+  // Cost exposed to navigation after combining semantic and measured costs.
   float traversability_cost = 0.5f;
   std::uint32_t observation_count = 0;
+  std::uint32_t semantic_observation_count = 0;
+  std::uint32_t traversability_observation_count = 0;
   ros::Time last_observed;
 };
 
@@ -84,9 +103,24 @@ struct VoxelSnapshot
   double z = 0.0;
   std::uint32_t label = kInvalidSemanticLabel;
   float semantic_confidence = 0.0f;
+  float semantic_cost = 0.5f;
+  float measured_traversability_cost = 0.5f;
+  bool has_measured_traversability = false;
   float traversability_cost = 0.5f;
   std::uint32_t observation_count = 0;
+  std::uint32_t semantic_observation_count = 0;
+  std::uint32_t traversability_observation_count = 0;
   ros::Time last_observed;
+};
+
+struct TraversabilityColumnSnapshot
+{
+  std::int32_t x_index = 0;
+  std::int32_t y_index = 0;
+  double x = 0.0;
+  double y = 0.0;
+  double z = 0.0;
+  float traversability_cost = 0.5f;
 };
 
 class SemanticVoxelMap
@@ -103,9 +137,15 @@ public:
   std::size_t prune(const ros::Time& reference_stamp);
   std::size_t pruneOutside(double center_x, double center_y, double center_z,
                            double radius);
+  std::size_t pruneOutsideBox(
+    double center_x, double center_y, double center_z,
+    const std::array<double, 4>& box_to_world_quaternion,
+    const std::array<double, 3>& minimum,
+    const std::array<double, 3>& maximum);
   void clear();
   std::size_t size() const;
   std::vector<VoxelSnapshot> snapshot() const;
+  std::vector<TraversabilityColumnSnapshot> traversabilityColumns() const;
 
   float classCost(std::uint32_t label) const;
   SemanticClass classDescription(std::uint32_t label) const;
@@ -116,6 +156,7 @@ public:
 
 private:
   float expectedSemanticCost(const SemanticEvidence& semantics) const;
+  float combinedTraversabilityCost(const SemanticVoxel& voxel) const;
   void enforceCapacity();
 
   SemanticVoxelMapConfig config_;

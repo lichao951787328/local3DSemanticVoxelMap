@@ -1,6 +1,8 @@
 # Input and coordinate frame
 input_topic: /semantic_pcl/semantic_pcl
 global_frame: world
+publish_local_cost_cloud: false
+input_layout: image
 semantic_field: semantic_color       # SSMI packed RGB stored as FLOAT32 bits
 confidence_field: semantic_confidence # optional; default below if absent
 cost_field: traversability           # optional direct cost in [0, 1]
@@ -36,6 +38,7 @@ semantic_new_class_prior: 0.8
 # Traversability: 0 is easy/safe, 1 is impassable/dangerous.
 unknown_cost: 0.50
 semantic_cost_weight: 0.80
+traversability_fusion_method: weighted_average
 cost_rise_alpha: 0.65
 cost_fall_alpha: 0.15
 

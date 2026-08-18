@@ -1,0 +1,34 @@
+<launch>
+  <!-- Test-only local goal generation from the fused body-frame cost cloud. -->
+  <arg name="cost_cloud_topic"
+       default="/local_3d_semantic_voxel_map/traversability_cost_cloud_wuba"/>
+  <arg name="goal_topic" default="/way_point"/>
+  <arg name="world_frame" default="world"/>
+
+  <node pkg="local3d_semantic_voxel_map"
+        type="test_local_goal_selector"
+        name="test_local_goal_selector"
+        output="screen">
+    <param name="cost_cloud_topic" value="$(arg cost_cloud_topic)"/>
+    <param name="goal_topic" value="$(arg goal_topic)"/>
+    <param name="world_frame" value="$(arg world_frame)"/>
+
+    <param name="grid_resolution" value="0.10"/>
+    <param name="min_forward" value="1.0"/>
+    <param name="max_forward" value="3.0"/>
+    <param name="max_lateral" value="1.5"/>
+    <param name="max_heading_deg" value="60.0"/>
+    <param name="goal_cost_threshold" value="0.30"/>
+    <param name="hard_cost_threshold" value="0.75"/>
+    <param name="safety_radius" value="0.40"/>
+    <param name="coverage_radius" value="0.18"/>
+    <param name="clearance_search_radius" value="1.0"/>
+    <param name="path_step" value="0.10"/>
+
+    <!-- Re-select slowly enough that localPlanner's target does not jitter. -->
+    <param name="selection_period" value="0.1"/>
+    <param name="top_k" value="5"/>
+    <param name="max_candidates_evaluated" value="10"/>
+    <param name="random_seed" value="42"/>
+  </node>
+</launch>

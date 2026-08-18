@@ -1,0 +1,88 @@
+<launch>
+  <!-- Offline integration test:
+       bag -> semantic voxel map -> local goal selector -> FAR localPlanner.
+       pathFollower is intentionally not started, so no velocity command is sent. -->
+  <arg name="bag"
+       default="/home/yanaibo/mapless_navigation/local_3d_semantic_voxel/local3DSemanticVoxelMap/dataset/2026-08-14-09-19-37.bag"/>
+  <arg name="play_bag" default="true"/>
+  <arg name="rviz" default="true"/>
+  <arg name="global_frame" default="map"/>
+  <arg name="reference_frame" default="map_start"/>
+  <arg name="vehicle_frame" default="wuba_base"/>
+  <arg name="input_topic" default="/grids_points"/>
+  <arg name="odometry_topic" default="/fusion_localization"/>
+  <arg name="goal_topic" default="/way_point"/>
+  <arg name="path_topic" default="/path"/>
+  <arg name="record_path_goal" default="true"/>
+  <arg name="path_goal_csv" default="/tmp/path_goal_alignment.csv"/>
+  <arg name="path_goal_tolerance" default="0.30"/>
+  <arg name="goal_timeout" default="0.50"/>
+  <arg name="invalid_goal_count_threshold" default="3"/>
+
+  <group if="$(arg play_bag)">
+    <param name="/use_sim_time" value="true"/>
+    <node pkg="rosbag" type="play" name="semantic_voxel_test_bag"
+          args="--clock --delay=2 $(arg bag)" output="screen"/>
+  </group>
+
+  <include file="$(find local3d_semantic_voxel_map)/launch/grids_points_voxel_map.launch">
+    <arg name="input_topic" value="$(arg input_topic)"/>
+    <arg name="global_frame" value="$(arg global_frame)"/>
+    <arg name="use_initial_pose_reference" value="true"/>
+    <arg name="reference_frame" value="$(arg reference_frame)"/>
+    <arg name="local_cost_frame" value="$(arg vehicle_frame)"/>
+    <arg name="rviz_frame" value="$(arg reference_frame)"/>
+    <arg name="rviz" value="false"/>
+  </include>
+
+  <include file="$(find local3d_semantic_voxel_map)/launch/test_local_goal_selector.launch">
+    <arg name="cost_cloud_topic"
+         value="/local_3d_semantic_voxel_map/traversability_cost_cloud_wuba"/>
+    <arg name="goal_topic" value="$(arg goal_topic)"/>
+    <arg name="world_frame" value="$(arg global_frame)"/>
+  </include>
+
+  <include file="$(find local_planner)/launch/local_planner_only.launch">
+    <arg name="worldFrameId" value="$(arg global_frame)"/>
+    <arg name="odometryTopic" value="$(arg odometry_topic)"/>
+    <arg name="staticObstacleTopic"
+         value="/local_3d_semantic_voxel_map/traversability_cost_cloud"/>
+    <arg name="useAddedObstacles" value="false"/>
+    <arg name="requireDynamicObstacleCloud" value="false"/>
+    <arg name="requireNonEmptyCostCloud" value="true"/>
+    <arg name="terrainVoxelSize" value="0.10"/>
+    <arg name="useTerrainAnalysis" value="true"/>
+    <arg name="groundHeightThre" value="0.10"/>
+    <arg name="obstacleHeightThre" value="0.75"/>
+    <arg name="costHeightThre" value="1.00"/>
+    <arg name="costScore" value="0.05"/>
+    <arg name="useCost" value="true"/>
+    <arg name="pointPerPathThre" value="1"/>
+    <arg name="waypointTopic" value="$(arg goal_topic)"/>
+    <arg name="goalValidityTopic" value="/test_local_goal_selector/valid"/>
+    <arg name="goalTimeout" value="$(arg goal_timeout)"/>
+    <arg name="invalidGoalCountThre" value="$(arg invalid_goal_count_threshold)"/>
+    <arg name="pathTopic" value="$(arg path_topic)"/>
+    <arg name="sensorFrameId" value="$(arg vehicle_frame)"/>
+    <arg name="vehicleFrameId" value="$(arg vehicle_frame)"/>
+    <arg name="maxSpeed" value="0.3"/>
+    <arg name="autonomySpeed" value="0.3"/>
+  </include>
+
+  <!-- Records each selected path in wuba_base and compares it with the goal
+       transformed into wuba_base at exactly the path timestamp. -->
+  <node if="$(arg record_path_goal)"
+        pkg="local3d_semantic_voxel_map"
+        type="record_path_goal_alignment.py"
+        name="path_goal_alignment_recorder"
+        output="screen">
+    <param name="goal_topic" value="$(arg goal_topic)"/>
+    <param name="path_topic" value="$(arg path_topic)"/>
+    <param name="output_csv" value="$(arg path_goal_csv)"/>
+    <param name="reach_tolerance" value="$(arg path_goal_tolerance)"/>
+    <param name="tf_timeout" value="0.20"/>
+  </node>
+
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="semantic_far_test_rviz"
+        args="-d $(find local3d_semantic_voxel_map)/rviz/semantic_voxel_map.rviz -f $(arg reference_frame)"/>
+</launch>

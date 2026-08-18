@@ -1,53 +1,237 @@
 Panels:
   - Class: rviz/Displays
-  - Class: rviz/Views
+    Help Height: 70
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+      Splitter Ratio: 0.45500001311302185
+    Tree Height: 1155
+Preferences:
+  PromptSaveOnExit: true
+Toolbars:
+  toolButtonStyle: 2
 Visualization Manager:
   Class: ""
   Displays:
-    - Class: rviz/Grid
-      Name: Grid
-      Enabled: true
-      Plane: XY
+    - Alpha: 0.5
       Cell Size: 1
-    - Class: rviz/Marker
-      Name: Semantic Voxels
+      Class: rviz/Grid
+      Color: 160; 160; 164
       Enabled: true
-      Marker Topic: /local_3d_semantic_voxel_map/semantic_voxels
-      Queue Size: 1
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 10
+      Reference Frame: <Fixed Frame>
+      Value: true
     - Class: rviz/Marker
-      Name: Traversability Voxels
+      Enabled: false
+      Marker Topic: /local_3d_semantic_voxel_map/semantic_voxels
+      Name: Semantic Voxels
+      Namespaces:
+        {}
+      Queue Size: 1
+      Value: false
+    - Class: rviz/Marker
       Enabled: false
       Marker Topic: /local_3d_semantic_voxel_map/traversability_voxels
+      Name: Traversability Voxels
+      Namespaces:
+        {}
       Queue Size: 1
-    - Class: rviz/PointCloud2
-      Name: Voxel Data
-      Enabled: false
-      Topic: /local_3d_semantic_voxel_map/voxel_cloud
-      Queue Size: 1
-      Style: Squares
-      Size (m): 0.1
+      Value: false
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
       Color Transformer: RGB8
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: Voxel Data
+      Position Transformer: ""
+      Queue Size: 1
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.10000000149011612
+      Style: Squares
+      Topic: /local_3d_semantic_voxel_map/voxel_cloud
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /test_local_goal_selector/candidate_marker
+      Name: Local Goal Candidates
+      Namespaces:
+        test_local_goal_candidates: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /test_local_goal_selector/goal_marker
+      Name: Selected Local Goal
+      Namespaces:
+        test_local_goal: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: Local Traversability Cost
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.05000000074505806
+      Style: Flat Squares
+      Topic: /local_3d_semantic_voxel_map/traversability_cost_cloud_wuba
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
+    - Alpha: 0.3499999940395355
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 1
+        Min Value: 0
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 80; 180; 255
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: FAR Feasible Paths
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: false
+      Size (Pixels): 2
+      Size (m): 0.02500000037252903
+      Style: Flat Squares
+      Topic: /free_paths
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: FAR Selected Path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /path
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /path_goal_alignment_recorder/alignment_markers
+      Name: Path Goal Alignment
+      Namespaces:
+        path_goal_alignment: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Class: rviz/Axes
+      Enabled: true
+      Length: 1
+      Name: wuba_base Axes
+      Radius: 0.10000000149011612
+      Reference Frame: wuba_base
+      Show Trail: false
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
-    Fixed Frame: world
+    Default Light: true
+    Fixed Frame: wuba_base
     Frame Rate: 30
   Name: root
   Tools:
     - Class: rviz/Interact
+      Hide Inactive Objects: true
     - Class: rviz/MoveCamera
     - Class: rviz/Select
+  Value: true
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 15
+      Distance: 13.551772117614746
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Field of View: 0.7853981852531433
       Focal Point:
         X: 0
         Y: 0
         Z: 1
-      Pitch: 0.6
-      Target Frame: base_link
-      Yaw: 0.8
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 1.494796633720398
+      Target Frame: wuba_base
+      Yaw: 1.5599993467330933
+    Saved: ~
 Window Geometry:
-  Height: 800
-  Width: 1200
+  Displays:
+    collapsed: false
+  Height: 1376
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd00000001000000000000025a00000506fc0200000001fb000000100044006900730070006c006100790073010000003d00000506000000c900ffffff000007580000050600000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Width: 2488
+  X: 72
+  Y: 27

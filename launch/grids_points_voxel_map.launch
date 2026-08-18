@@ -1,0 +1,26 @@
+<launch>
+  <arg name="config" default="$(find local3d_semantic_voxel_map)/config/grids_points_voxel_map.yaml"/>
+  <arg name="input_topic" default="/grids_points"/>
+  <arg name="global_frame" default="map"/>
+  <arg name="use_initial_pose_reference" default="true"/>
+  <arg name="reference_frame" default="map_start"/>
+  <arg name="local_cost_frame" default="wuba_base"/>
+  <arg name="rviz_frame" default="$(arg reference_frame)"/>
+  <arg name="rviz" default="true"/>
+
+  <node pkg="local3d_semantic_voxel_map"
+        type="local_3d_semantic_voxel_map_node"
+        name="local_3d_semantic_voxel_map"
+        output="screen"
+        required="true">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="input_topic" value="$(arg input_topic)"/>
+    <param name="global_frame" value="$(arg global_frame)"/>
+    <param name="use_initial_pose_reference" value="$(arg use_initial_pose_reference)"/>
+    <param name="reference_frame" value="$(arg reference_frame)"/>
+    <param name="local_cost_frame" value="$(arg local_cost_frame)"/>
+  </node>
+
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="semantic_voxel_rviz"
+        args="-d $(find local3d_semantic_voxel_map)/rviz/semantic_voxel_map.rviz -f $(arg rviz_frame)"/>
+</launch>

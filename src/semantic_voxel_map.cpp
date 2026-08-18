@@ -35,6 +35,7 @@ SemanticVoxelMap::SemanticVoxelMap(const SemanticVoxelMapConfig& config)
   }
   config_.unknown_cost = clampUnit(config_.unknown_cost);
   config_.semantic_cost_weight = clampUnit(config_.semantic_cost_weight);
+  config_.semantic_risk_alpha = clampUnit(config_.semantic_risk_alpha);
   config_.cost_rise_alpha = clampUnit(config_.cost_rise_alpha);
   config_.cost_fall_alpha = clampUnit(config_.cost_fall_alpha);
 }
@@ -71,7 +72,9 @@ void SemanticVoxelMap::keyToWorld(const VoxelKey& key,
 void SemanticVoxelMap::integrate(const VoxelKey& key,
                                  const VoxelObservation& observation)
 {
-  if (observation.label == kInvalidSemanticLabel)
+  const bool has_semantic = observation.label != kInvalidSemanticLabel &&
+                            observation.semantic_confidence > 0.0f;
+  if (!has_semantic && !observation.has_traversability_cost)
   {
     return;
   }
@@ -81,26 +84,40 @@ void SemanticVoxelMap::integrate(const VoxelKey& key,
   if (found == voxels_.end())
   {
     found = voxels_.emplace(key, SemanticVoxel(config_.semantic_fusion)).first;
+    found->second.semantic_cost = config_.unknown_cost;
+    found->second.measured_traversability_cost = config_.unknown_cost;
     found->second.traversability_cost = config_.unknown_cost;
   }
 
   SemanticVoxel& voxel = found->second;
-  const float confidence = clampUnit(observation.semantic_confidence);
-  voxel.semantics.fuse(observation.label, confidence);
+  const float semantic_confidence = clampUnit(observation.semantic_confidence);
+  if (has_semantic)
+  {
+    voxel.semantics.fuse(observation.label, semantic_confidence);
+    voxel.semantic_cost = expectedSemanticCost(voxel.semantics);
+    ++voxel.semantic_observation_count;
+  }
 
-  const float semantic_cost = expectedSemanticCost(voxel.semantics);
-  float target_cost = semantic_cost;
   if (observation.has_traversability_cost)
   {
     const float measured_cost = clampUnit(observation.traversability_cost);
-    target_cost = config_.semantic_cost_weight * semantic_cost +
-                  (1.0f - config_.semantic_cost_weight) * measured_cost;
+    if (!voxel.has_measured_traversability)
+    {
+      voxel.measured_traversability_cost = measured_cost;
+      voxel.has_measured_traversability = true;
+    }
+    else
+    {
+      const float alpha = measured_cost >= voxel.measured_traversability_cost ?
+        config_.cost_rise_alpha : config_.cost_fall_alpha;
+      voxel.measured_traversability_cost = clampUnit(
+        voxel.measured_traversability_cost +
+        alpha * (measured_cost - voxel.measured_traversability_cost));
+    }
+    ++voxel.traversability_observation_count;
   }
 
-  const float alpha = target_cost >= voxel.traversability_cost ?
-    config_.cost_rise_alpha : config_.cost_fall_alpha;
-  voxel.traversability_cost = clampUnit(voxel.traversability_cost +
-    alpha * confidence * (target_cost - voxel.traversability_cost));
+  voxel.traversability_cost = combinedTraversabilityCost(voxel);
   voxel.last_observed = observation.stamp.isZero() ? ros::Time::now() : observation.stamp;
   ++voxel.observation_count;
 
@@ -180,6 +197,70 @@ std::size_t SemanticVoxelMap::pruneOutside(const double center_x,
   return removed;
 }
 
+std::size_t SemanticVoxelMap::pruneOutsideBox(
+  const double center_x, const double center_y, const double center_z,
+  const std::array<double, 4>& box_to_world_quaternion,
+  const std::array<double, 3>& minimum,
+  const std::array<double, 3>& maximum)
+{
+  if (minimum[0] >= maximum[0] || minimum[1] >= maximum[1] ||
+      minimum[2] >= maximum[2])
+  {
+    return 0;
+  }
+
+  double qx = box_to_world_quaternion[0];
+  double qy = box_to_world_quaternion[1];
+  double qz = box_to_world_quaternion[2];
+  double qw = box_to_world_quaternion[3];
+  const double norm = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+  if (norm > 1e-12)
+  {
+    qx /= norm;
+    qy /= norm;
+    qz /= norm;
+    qw /= norm;
+  }
+  else
+  {
+    qx = qy = qz = 0.0;
+    qw = 1.0;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::size_t removed = 0;
+  for (auto iterator = voxels_.begin(); iterator != voxels_.end();)
+  {
+    double x, y, z;
+    keyToWorld(iterator->first, x, y, z);
+    const double dx = x - center_x;
+    const double dy = y - center_y;
+    const double dz = z - center_z;
+
+    // Rotate map-frame displacement by the inverse box orientation.  The
+    // resulting coordinates are relative to the current input sensor frame.
+    const double tx = 2.0 * (-qy * dz + qz * dy);
+    const double ty = 2.0 * (-qz * dx + qx * dz);
+    const double tz = 2.0 * (-qx * dy + qy * dx);
+    const double local_x = dx + qw * tx + (-qy * tz + qz * ty);
+    const double local_y = dy + qw * ty + (-qz * tx + qx * tz);
+    const double local_z = dz + qw * tz + (-qx * ty + qy * tx);
+
+    if (local_x < minimum[0] || local_x > maximum[0] ||
+        local_y < minimum[1] || local_y > maximum[1] ||
+        local_z < minimum[2] || local_z > maximum[2])
+    {
+      iterator = voxels_.erase(iterator);
+      ++removed;
+    }
+    else
+    {
+      ++iterator;
+    }
+  }
+  return removed;
+}
+
 void SemanticVoxelMap::clear()
 {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -204,10 +285,59 @@ std::vector<VoxelSnapshot> SemanticVoxelMap::snapshot() const
     keyToWorld(entry.first, item.x, item.y, item.z);
     item.label = entry.second.semantics.dominantLabel();
     item.semantic_confidence = entry.second.semantics.dominantConfidence();
+    item.semantic_cost = entry.second.semantic_cost;
+    item.measured_traversability_cost = entry.second.measured_traversability_cost;
+    item.has_measured_traversability = entry.second.has_measured_traversability;
     item.traversability_cost = entry.second.traversability_cost;
     item.observation_count = entry.second.observation_count;
+    item.semantic_observation_count = entry.second.semantic_observation_count;
+    item.traversability_observation_count =
+      entry.second.traversability_observation_count;
     item.last_observed = entry.second.last_observed;
     output.push_back(item);
+  }
+  return output;
+}
+
+std::vector<TraversabilityColumnSnapshot>
+SemanticVoxelMap::traversabilityColumns() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::unordered_map<std::uint64_t, TraversabilityColumnSnapshot> columns;
+  columns.reserve(voxels_.size());
+  const double half = config_.voxel_size * 0.5;
+  for (const auto& entry : voxels_)
+  {
+    const std::uint64_t key =
+      (static_cast<std::uint64_t>(static_cast<std::uint32_t>(entry.first.x)) << 32u) |
+      static_cast<std::uint32_t>(entry.first.y);
+    const double z = static_cast<double>(entry.first.z) * config_.voxel_size + half;
+    const auto found = columns.find(key);
+    if (found == columns.end())
+    {
+      TraversabilityColumnSnapshot column;
+      column.x_index = entry.first.x;
+      column.y_index = entry.first.y;
+      column.x = static_cast<double>(entry.first.x) * config_.voxel_size + half;
+      column.y = static_cast<double>(entry.first.y) * config_.voxel_size + half;
+      column.z = z;
+      column.traversability_cost = entry.second.traversability_cost;
+      columns.emplace(key, column);
+    }
+    else if (entry.second.traversability_cost > found->second.traversability_cost ||
+             (entry.second.traversability_cost == found->second.traversability_cost &&
+              z < found->second.z))
+    {
+      found->second.z = z;
+      found->second.traversability_cost = entry.second.traversability_cost;
+    }
+  }
+
+  std::vector<TraversabilityColumnSnapshot> output;
+  output.reserve(columns.size());
+  for (const auto& entry : columns)
+  {
+    output.push_back(entry.second);
   }
   return output;
 }
@@ -255,8 +385,10 @@ bool SemanticVoxelMap::saveCsv(const std::string& path, std::string& error) cons
     return false;
   }
 
-  stream << "# local3d_semantic_voxel_map v1 voxel_size=" << config_.voxel_size << '\n';
-  stream << "x,y,z,label0,loge0,label1,loge1,label2,loge2,others,cost,observations,last_observed\n";
+  stream << "# local3d_semantic_voxel_map v2 voxel_size=" << config_.voxel_size << '\n';
+  stream << "x,y,z,label0,loge0,label1,loge1,label2,loge2,others,"
+            "semantic_cost,measured_cost,has_measured,final_cost,observations,"
+            "semantic_observations,traversability_observations,last_observed\n";
   stream << std::setprecision(10);
   for (const auto& entry : voxels_)
   {
@@ -267,8 +399,13 @@ bool SemanticVoxelMap::saveCsv(const std::string& path, std::string& error) cons
       stream << ',' << hypothesis.label << ',' << hypothesis.log_evidence;
     }
     stream << ',' << entry.second.semantics.othersLogEvidence()
+           << ',' << entry.second.semantic_cost
+           << ',' << entry.second.measured_traversability_cost
+           << ',' << (entry.second.has_measured_traversability ? 1 : 0)
            << ',' << entry.second.traversability_cost
            << ',' << entry.second.observation_count
+           << ',' << entry.second.semantic_observation_count
+           << ',' << entry.second.traversability_observation_count
            << ',' << entry.second.last_observed.toSec() << '\n';
   }
   if (!stream.good())
@@ -303,9 +440,6 @@ bool SemanticVoxelMap::loadCsv(const std::string& path, std::string& error)
     VoxelKey key;
     std::array<SemanticHypothesis, kSemanticTopK> hypotheses;
     float others = 0.0f;
-    float cost = config_.unknown_cost;
-    std::uint32_t observations = 0;
-    double stamp = 0.0;
     if (!(fields >> key.x >> key.y >> key.z))
     {
       error = "invalid voxel key at line " + std::to_string(line_number);
@@ -319,17 +453,51 @@ bool SemanticVoxelMap::loadCsv(const std::string& path, std::string& error)
         return false;
       }
     }
-    if (!(fields >> others >> cost >> observations >> stamp))
+    if (!(fields >> others))
     {
       error = "invalid voxel state at line " + std::to_string(line_number);
       return false;
     }
 
+    std::vector<double> state;
+    double value = 0.0;
+    while (fields >> value)
+    {
+      state.push_back(value);
+    }
+    if (state.size() != 3u && state.size() != 8u)
+    {
+      error = "invalid voxel state field count at line " +
+              std::to_string(line_number);
+      return false;
+    }
+
     SemanticVoxel voxel(config_.semantic_fusion);
     voxel.semantics.restore(hypotheses, others);
-    voxel.traversability_cost = clampUnit(cost);
-    voxel.observation_count = observations;
-    voxel.last_observed.fromSec(stamp);
+    if (state.size() == 8u)
+    {
+      voxel.semantic_cost = clampUnit(static_cast<float>(state[0]));
+      voxel.measured_traversability_cost = clampUnit(static_cast<float>(state[1]));
+      voxel.has_measured_traversability = state[2] != 0.0;
+      voxel.traversability_cost = clampUnit(static_cast<float>(state[3]));
+      voxel.observation_count = static_cast<std::uint32_t>(state[4]);
+      voxel.semantic_observation_count = static_cast<std::uint32_t>(state[5]);
+      voxel.traversability_observation_count = static_cast<std::uint32_t>(state[6]);
+      voxel.last_observed.fromSec(state[7]);
+    }
+    else
+    {
+      // Version 1 stored only the final cost. Treat it as a measured value so
+      // loading an old map preserves its navigation behavior.
+      voxel.semantic_cost = expectedSemanticCost(voxel.semantics);
+      voxel.measured_traversability_cost = clampUnit(static_cast<float>(state[0]));
+      voxel.has_measured_traversability = true;
+      voxel.traversability_cost = voxel.measured_traversability_cost;
+      voxel.observation_count = static_cast<std::uint32_t>(state[1]);
+      voxel.semantic_observation_count = voxel.observation_count;
+      voxel.traversability_observation_count = voxel.observation_count;
+      voxel.last_observed.fromSec(state[2]);
+    }
     loaded.emplace(key, voxel);
   }
 
@@ -350,6 +518,35 @@ float SemanticVoxelMap::expectedSemanticCost(const SemanticEvidence& semantics) 
     expected += item.second * cost;
   }
   return clampUnit(expected);
+}
+
+float SemanticVoxelMap::combinedTraversabilityCost(const SemanticVoxel& voxel) const
+{
+  const bool has_semantic = !voxel.semantics.empty();
+  if (!has_semantic)
+  {
+    return voxel.has_measured_traversability ?
+      voxel.measured_traversability_cost : config_.unknown_cost;
+  }
+  if (!voxel.has_measured_traversability)
+  {
+    return voxel.semantic_cost;
+  }
+  if (config_.traversability_fusion_method == TraversabilityFusionMethod::Maximum)
+  {
+    return std::max(voxel.semantic_cost, voxel.measured_traversability_cost);
+  }
+  if (config_.traversability_fusion_method ==
+      TraversabilityFusionMethod::ConfidenceWeightedRaise)
+  {
+    const float semantic_confidence = voxel.semantics.dominantConfidence();
+    const float risk_gap = std::max(
+      0.0f, voxel.semantic_cost - voxel.measured_traversability_cost);
+    return clampUnit(voxel.measured_traversability_cost +
+      config_.semantic_risk_alpha * semantic_confidence * risk_gap);
+  }
+  return clampUnit(config_.semantic_cost_weight * voxel.semantic_cost +
+    (1.0f - config_.semantic_cost_weight) * voxel.measured_traversability_cost);
 }
 
 void SemanticVoxelMap::enforceCapacity()
