@@ -85,8 +85,11 @@ effect quickly while declaring a voxel safe again requires repeated evidence.
 For the simulation profile, which has no traversability field, the published
 snapshot additionally builds a terrain height neighborhood from labels 0, 1 and
 9. Missing-cost terrain columns within 0.20 m are compared; if their height
-difference is greater than 0.15 m, voxels on both sides are raised to cost 1.0.
-This identifies ground/stair boundaries while leaving flat terrain low-cost.
+difference is greater than 0.15 m plus a small numerical epsilon, voxels on both
+sides are raised to cost 1.0. The simulation map uses 0.10 m XY cells and 0.05 m
+Z cells, preventing a 0.10 m stair rise from expanding to 0.20 m solely through
+center-of-voxel quantization. This identifies ground/stair boundaries while
+leaving flat terrain low-cost.
 Voxels that have ever received measured traversability are excluded from this
 geometry inference, so `/grids_points` costs are never overwritten.
 
@@ -106,25 +109,43 @@ Published topics:
 - `~traversability_voxels`: green-yellow-red cost cubes;
 - `~voxel_cloud`: `PointCloud2` with `rgb`, `label`, `semantic_confidence`,
   `traversability`, `intensity`, and `observations` fields.
-- `~global_semantic_admission_grid`: a filtered view of the same 0.10 m local
-  voxel snapshot, not a persistent global map. It contains `x/y/z` (`float32`),
+- `~global_semantic_admission_grid`: a filtered view of the same local voxel
+  snapshot (simulation: 0.10 m XY and 0.05 m Z; bag: isotropic 0.10 m), not a
+  persistent global map. It contains `x/y/z` (`float32`),
   `traversability` (`float32`), and the upstream-compatible `semantic_lable`
   (`uint32`). Coordinates are frozen in the configured robot frame at the input
   acquisition time. Every non-dynamic voxel is retained, including ordinary
   low-cost terrain and static objects. Dynamic labels 11-18 remain in
   `~voxel_cloud` but are excluded here by default. A semantic-ground stair edge
-  raised by the height rule is still present, but carries high cost so the
-  downstream adapter encodes it as an obstacle while its local label stays 0/1/9.
+  raised by the height rule is still present, but carries high cost while its
+  local label stays 0/1/9.
+- `/semantic_pcl/global_admitted`: the same filtered snapshot converted directly
+  to SSMI's `x/y/z/rgb/semantic_color` schema. Simulation and bag labels use one
+  canonical output encoding even though their input palettes differ. Both color
+  fields contain identical packed bits. A point whose final traversability is
+  at least `~ssmi_obstacle_traversability_threshold` (default 0.75) is encoded as
+  a standard obstacle; other known labels retain their canonical semantic
+  encoding. SSMI can therefore distinguish obstacle semantics from traversable
+  terrain without a separate conversion node.
 - `~confirmed` mirrors the selected local snapshot; `~rejected_dynamic` contains
-  excluded labels 11-18. `~rejected_unknown` and the legacy candidate/rear/
-  revocation debug topics publish empty clouds.
+  excluded labels 11-18. `~revocation_candidates` shows remembered SSMI
+  obstacle voxels currently receiving positive free evidence, and
+  `~revoked_free` emits the exact voxels whose multi-frame check completed.
+  `~rejected_unknown`, `~rejected_rear`, and `~revoked_reclassified` remain
+  empty in the current policy.
 
-This output has no multi-frame stability state, 0.40 m re-voxelization, rear
-corridor, or permanent admission/revocation state machine. A downstream node may
-accumulate these local observations globally, but that persistence is explicitly
-outside this node.
+Insertion remains an immediate 0.10 m local snapshot with no multi-frame
+stability gate, 0.40 m re-voxelization, or rear corridor. A separate 0.10 m
+mirror remembers only obstacle-like endpoints already sent to SSMI. Mere
+absence, rolling-window pruning, and dynamic occlusion never revoke an endpoint.
+Five distinct frames over at least 0.5 s of confident low-cost terrain or
+configured raw-depth ray traversal are required. Simulation enables ray
+evidence to remove trails from movers mislabeled as static; the processed
+`/grids_points` profile disables ray evidence and accepts only direct semantic/
+traversability contradiction.
 
-All map clouds use the last successfully processed input acquisition stamp.
+All map clouds, including the direct SSMI cloud, use the last successfully
+processed input acquisition stamp.
 The publish timer repeats that acquisition-time snapshot and never refreshes
 its header when the active input stops. This node owns the initial
 `global_frame -> map_start` static transform (`map -> map_start` for the bag
@@ -143,6 +164,45 @@ rosservice call /local_3d_semantic_voxel_map/load_map
 
 Save/load uses `~map_file` and preserves the full Top-3 semantic evidence, cost,
 observation count, and timestamp of every voxel.
+
+## Height-admission diagnostics
+
+`diagnose_height_admission.py` checks the simulation height rule through all
+three exact-stamp snapshots: `~voxel_cloud`,
+`~global_semantic_admission_grid`, and `/semantic_pcl/global_admitted`. Run it
+after the voxel node:
+
+```bash
+rosrun local3d_semantic_voxel_map diagnose_height_admission.py \
+  _csv_path:=/tmp/height_admission_diagnostics.csv
+```
+
+The CSV records the terrain and height-obstacle counts, the maximum triggering
+height difference and point pair, the robot pose obtained from TF at the cloud
+acquisition stamp, and whether every admitted high-cost terrain point received
+SSMI's obstacle encoding. It also audits `/semantic_pcl/global_admitted`
+directly: label-9 staircase points are separated into retained green points,
+high-cost points recolored to the canonical wall color, and unexpected colors.
+The CSV reports both color fields, expected-encoding mismatches, and the spatial
+extent of each recolored staircase patch. It also publishes RViz clouds in the
+diagnostic node's private namespace:
+
+- `~height_obstacle_voxels`: all terrain voxels raised to obstacle cost;
+- `~within_column_voxels`: triggers caused within one XY column;
+- `~neighbor_column_voxels`: triggers caused by neighboring columns;
+- `~downstream_height_obstacles`: the selected points in the admission frame;
+- `~downstream_encoding_mismatches`: points not encoded as SSMI obstacles.
+- `~ssmi_stair_green`: staircase points that remain canonical terrain green;
+- `~ssmi_stair_recolored_wall`: staircase points recolored by the high-cost
+  SSMI obstacle rule;
+- `~ssmi_stair_unexpected_color`: staircase points with neither expected color.
+
+All diagnostic clouds retain the source acquisition stamp. A missing point,
+occlusion, or timer republish is not interpreted as height evidence.
+
+`voxel_size_xy` and `voxel_size_z` configure independent planar and vertical
+resolution. The legacy `voxel_size` parameter remains supported and supplies
+both defaults when either axis-specific parameter is absent.
 
 ## Offline voxel-to-FAR planning test
 
@@ -218,3 +278,11 @@ fusion; old voxels outside the moved box are pruned at the publish rate.
 `local_box_enabled=false`. `max_range` is an independent spherical sensor
 outlier filter; values `<=0` disable it. The bundled cuboid configuration
 disables `max_range` because the box already provides finite input bounds.
+
+For simulation, `robot_body_exclusion_enabled` removes an asymmetric planar
+rectangle in the incoming `base_link` cloud before coordinate transformation,
+voxel fusion, and terrain-height inference. The bundled simulation profiles use
+`x=[-0.5, 0.3] m` and `y=[-0.3, 0.3] m` for all heights, with the larger
+rearward extent accounting for the forward camera placement. This prevents leg
+and body returns from creating false height obstacles. The recorded
+`/grids_points` profile explicitly disables this source-specific filter.

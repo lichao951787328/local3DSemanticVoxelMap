@@ -1,12 +1,15 @@
 #include "local3d_semantic_voxel_map/semantic_fusion.hpp"
 #include "local3d_semantic_voxel_map/semantic_voxel_map.hpp"
 #include "local3d_semantic_voxel_map/global_semantic_admission.hpp"
+#include "local3d_semantic_voxel_map/obstacle_revocation.hpp"
+#include "local3d_semantic_voxel_map/ssmi_semantic_encoding.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <set>
 #include <string>
 #include <unistd.h>
 
@@ -49,13 +52,171 @@ map::VoxelSnapshot voxelSnapshot(
   voxel.y = 0.1 * static_cast<double>(y) + 0.05;
   voxel.z = 0.1 * static_cast<double>(z) + 0.05;
   voxel.label = label;
+  voxel.semantic_confidence = 1.0f;
   voxel.traversability_cost = cost;
   voxel.has_measured_traversability = has_measured;
   voxel.measured_traversability_cost = cost;
   return voxel;
 }
 
+ros::Time stamp(const double seconds)
+{
+  ros::Time output;
+  output.fromSec(seconds);
+  return output;
+}
+
 }  // namespace
+
+TEST(SsmiSemanticEncoding, UsesCanonicalLabelColorAfterSourceNormalization)
+{
+  const map::SemanticRgb road = map::ssmiSemanticColor(0u, 0.10f, 0.75f);
+  const map::SemanticRgb vehicle = map::ssmiSemanticColor(13u, 0.10f, 0.75f);
+
+  EXPECT_NE(map::packSemanticRgb(road), map::packSemanticRgb(vehicle));
+  EXPECT_EQ(0x00804080u, map::packSemanticRgb(road));
+}
+
+TEST(SsmiSemanticEncoding, CanonicalLabelsHaveDistinctOnWireEncodings)
+{
+  std::set<std::uint32_t> encodings;
+  for (std::uint32_t label = 0u; label <= 18u; ++label)
+  {
+    encodings.insert(map::packSemanticRgb(
+      map::ssmiSemanticColor(label, 0.10f, 0.75f)));
+  }
+  EXPECT_EQ(19u, encodings.size());
+}
+
+TEST(SsmiSemanticEncoding, HighCostOverridesTerrainWithObstacleEncoding)
+{
+  const map::SemanticRgb high_cost =
+    map::ssmiSemanticColor(9u, 0.75f, 0.75f);
+  const map::SemanticRgb wall = map::ssmiSemanticColor(3u, 0.10f, 0.75f);
+  const map::SemanticRgb terrain = map::ssmiSemanticColor(9u, 0.74f, 0.75f);
+
+  EXPECT_EQ(map::packSemanticRgb(wall), map::packSemanticRgb(high_cost));
+  EXPECT_NE(map::packSemanticRgb(terrain), map::packSemanticRgb(high_cost));
+}
+
+TEST(SsmiSemanticEncoding, UnknownLowCostLabelUsesNeutralEncoding)
+{
+  const map::SemanticRgb unknown =
+    map::ssmiSemanticColor(map::kInvalidSemanticLabel, 0.10f, 0.75f);
+  EXPECT_EQ(0x007f7f7fu, map::packSemanticRgb(unknown));
+}
+
+TEST(ObstacleRevocation, AbsenceAloneNeverRevokesRememberedObstacle)
+{
+  map::ObstacleRevocationConfig config;
+  config.minimum_free_frames = 2u;
+  config.minimum_free_duration = 0.1;
+  map::ObstacleRevocationTracker tracker(config);
+  const std::vector<map::VoxelSnapshot> obstacle{
+    voxelSnapshot(10, 0, 0, 2u, 0.95f)};
+  const std::unordered_set<map::VoxelKey, map::VoxelKeyHash> no_rays;
+
+  tracker.update(obstacle, no_rays, stamp(1.0));
+  EXPECT_EQ(1u, tracker.trackedCount());
+  EXPECT_TRUE(tracker.update({}, no_rays, stamp(1.1)).revoked_free.empty());
+  EXPECT_TRUE(tracker.update({}, no_rays, stamp(1.2)).revoked_free.empty());
+  EXPECT_EQ(1u, tracker.trackedCount());
+}
+
+TEST(ObstacleRevocation, ConsecutiveLowCostTerrainRevokesOldObstacle)
+{
+  map::ObstacleRevocationConfig config;
+  config.minimum_free_frames = 3u;
+  config.minimum_free_duration = 0.2;
+  map::ObstacleRevocationTracker tracker(config);
+  const std::unordered_set<map::VoxelKey, map::VoxelKeyHash> no_rays;
+  tracker.update({voxelSnapshot(10, 0, 0, 2u, 0.95f)}, no_rays,
+                 stamp(1.0));
+  std::vector<map::VoxelSnapshot> terrain{
+    voxelSnapshot(10, 0, 0, 0u, 0.05f)};
+
+  terrain.front().last_observed = stamp(1.1);
+  EXPECT_TRUE(tracker.update(terrain, no_rays, stamp(1.1)).revoked_free.empty());
+  terrain.front().last_observed = stamp(1.2);
+  EXPECT_TRUE(tracker.update(terrain, no_rays, stamp(1.2)).revoked_free.empty());
+  terrain.front().last_observed = stamp(1.3);
+  const map::ObstacleRevocationResult result =
+    tracker.update(terrain, no_rays, stamp(1.3));
+  ASSERT_EQ(1u, result.revoked_free.size());
+  EXPECT_EQ(0u, tracker.trackedCount());
+  EXPECT_EQ(tracker.keyFor(1.05, 0.05, 0.05),
+            result.revoked_free.front().key);
+}
+
+TEST(ObstacleRevocation, DynamicOcclusionBreaksFreeContradiction)
+{
+  map::ObstacleRevocationConfig config;
+  config.minimum_free_frames = 2u;
+  config.minimum_free_duration = 0.1;
+  map::ObstacleRevocationTracker tracker(config);
+  const std::unordered_set<map::VoxelKey, map::VoxelKeyHash> no_rays;
+  tracker.update({voxelSnapshot(10, 0, 0, 2u, 0.95f)}, no_rays,
+                 stamp(1.0));
+  std::vector<map::VoxelSnapshot> terrain{
+    voxelSnapshot(10, 0, 0, 0u, 0.05f)};
+  const std::vector<map::VoxelSnapshot> dynamic{
+    voxelSnapshot(10, 0, 0, 11u, 1.0f)};
+
+  terrain.front().last_observed = stamp(1.1);
+  tracker.update(terrain, no_rays, stamp(1.1));
+  tracker.update(dynamic, no_rays, stamp(1.2));
+  terrain.front().last_observed = stamp(1.3);
+  EXPECT_TRUE(tracker.update(terrain, no_rays, stamp(1.3)).revoked_free.empty());
+  terrain.front().last_observed = stamp(1.4);
+  EXPECT_EQ(1u,
+    tracker.update(terrain, no_rays, stamp(1.4)).revoked_free.size());
+}
+
+TEST(ObstacleRevocation, CachedTerrainIsNotRepeatedFreeEvidence)
+{
+  map::ObstacleRevocationConfig config;
+  config.minimum_free_frames = 2u;
+  config.minimum_free_duration = 0.1;
+  map::ObstacleRevocationTracker tracker(config);
+  const std::unordered_set<map::VoxelKey, map::VoxelKeyHash> no_rays;
+  tracker.update({voxelSnapshot(10, 0, 0, 2u, 0.95f)}, no_rays,
+                 stamp(1.0));
+  std::vector<map::VoxelSnapshot> cached_terrain{
+    voxelSnapshot(10, 0, 0, 0u, 0.05f)};
+  cached_terrain.front().last_observed = stamp(1.1);
+
+  tracker.update(cached_terrain, no_rays, stamp(1.1));
+  EXPECT_TRUE(
+    tracker.update(cached_terrain, no_rays, stamp(1.2)).revoked_free.empty());
+  EXPECT_EQ(1u, tracker.trackedCount());
+}
+
+TEST(ObstacleRevocation, RayTraversalClearsFalseStaticTrailButNotEndpoint)
+{
+  map::ObstacleRevocationConfig config;
+  config.minimum_free_frames = 1u;
+  config.minimum_free_duration = 0.0;
+  config.ray_endpoint_margin = 0.20;
+  map::ObstacleRevocationTracker tracker(config);
+  const std::unordered_set<map::VoxelKey, map::VoxelKeyHash> no_rays;
+  tracker.update({voxelSnapshot(10, 0, 0, 2u, 0.95f)}, no_rays,
+                 stamp(1.0));
+
+  std::unordered_set<map::VoxelKey, map::VoxelKeyHash> ray_evidence;
+  tracker.collectTrackedRayEvidence(
+    0.05, 0.05, 0.05, 3.05, 0.05, 0.05, ray_evidence);
+  ASSERT_EQ(1u, ray_evidence.size());
+  EXPECT_EQ(1u,
+    tracker.update({}, ray_evidence, stamp(1.1)).revoked_free.size());
+
+  map::ObstacleRevocationTracker endpoint_tracker(config);
+  endpoint_tracker.update(
+    {voxelSnapshot(30, 0, 0, 2u, 0.95f)}, no_rays, stamp(1.0));
+  ray_evidence.clear();
+  endpoint_tracker.collectTrackedRayEvidence(
+    0.05, 0.05, 0.05, 3.05, 0.05, 0.05, ray_evidence);
+  EXPECT_TRUE(ray_evidence.empty());
+}
 
 TEST(TerrainHeightCost, RaisesBothSidesOfMissingCostTerrainStep)
 {
@@ -79,6 +240,105 @@ TEST(TerrainHeightCost, RaisesBothSidesOfMissingCostTerrainStep)
     {
       return column.traversability_cost == 1.0f;
     }));
+}
+
+TEST(TerrainHeightCost, EightNeighborRadiusAllowsCumulativeStairRise)
+{
+  map::TerrainHeightCostConfig config;
+  config.enabled = true;
+  config.height_difference_threshold = 0.15;
+  config.neighborhood_radius = 0.15;
+  config.obstacle_cost = 1.0f;
+  std::vector<map::VoxelSnapshot> voxels{
+    voxelSnapshot(0, 0, 0, 0u),
+    voxelSnapshot(1, 0, 1, 9u),
+    voxelSnapshot(2, 0, 2, 9u)};
+
+  EXPECT_EQ(0u, map::applyTerrainHeightDiscontinuityCost(voxels, 0.10, config));
+  EXPECT_TRUE(std::all_of(voxels.begin(), voxels.end(),
+    [](const map::VoxelSnapshot& voxel)
+    {
+      return voxel.traversability_cost < 1.0f;
+    }));
+}
+
+TEST(TerrainHeightCost, EightNeighborRadiusStillRejectsAdjacentCliff)
+{
+  map::TerrainHeightCostConfig config;
+  config.enabled = true;
+  config.height_difference_threshold = 0.15;
+  config.neighborhood_radius = 0.15;
+  config.obstacle_cost = 1.0f;
+  std::vector<map::VoxelSnapshot> voxels{
+    voxelSnapshot(0, 0, 0, 0u),
+    voxelSnapshot(1, 0, 2, 9u)};
+
+  EXPECT_EQ(2u, map::applyTerrainHeightDiscontinuityCost(voxels, 0.10, config));
+  EXPECT_TRUE(std::all_of(voxels.begin(), voxels.end(),
+    [](const map::VoxelSnapshot& voxel)
+    {
+      return voxel.traversability_cost == 1.0f;
+    }));
+}
+
+TEST(TerrainHeightCost, VerticalHalfResolutionDoesNotInflateOneStepIntoObstacle)
+{
+  map::SemanticVoxelMapConfig map_config;
+  map_config.voxel_size_xy = 0.10;
+  map_config.voxel_size_z = 0.05;
+  map_config.decay_seconds = -1.0;
+  map::SemanticVoxelMap voxel_map(map_config);
+
+  map::VoxelObservation observation;
+  observation.label = 9u;
+  observation.stamp.fromSec(1.0);
+  // The two raw heights straddle 0.05 m bin boundaries. Their true separation
+  // is about 0.10 m, while their 0.05 m voxel centers are 0.15 m apart.
+  voxel_map.integrate(0.01, 0.01, 0.499999, observation);
+  voxel_map.integrate(0.01, 0.01, 0.600001, observation);
+
+  std::vector<map::VoxelSnapshot> voxels = voxel_map.snapshot();
+  ASSERT_EQ(2u, voxels.size());
+  const auto minimum_maximum = std::minmax_element(
+    voxels.begin(), voxels.end(),
+    [](const map::VoxelSnapshot& lhs, const map::VoxelSnapshot& rhs)
+    {
+      return lhs.z < rhs.z;
+    });
+  EXPECT_NEAR(0.15,
+              minimum_maximum.second->z - minimum_maximum.first->z, 1e-9);
+
+  map::TerrainHeightCostConfig height_config;
+  height_config.enabled = true;
+  height_config.height_difference_threshold = 0.15;
+  height_config.comparison_epsilon = 1e-6;
+  EXPECT_EQ(0u, map::applyTerrainHeightDiscontinuityCost(
+    voxels, voxel_map.voxelSizeXY(), height_config));
+  EXPECT_TRUE(std::all_of(voxels.begin(), voxels.end(),
+    [](const map::VoxelSnapshot& voxel)
+    {
+      return voxel.traversability_cost < 1.0f;
+    }));
+}
+
+TEST(InputPointFilter, PlanarRobotBodyExclusionIncludesConfiguredBoundary)
+{
+  EXPECT_TRUE(map::isInsidePlanarExclusion(
+    -0.5, -0.3, -0.5, 0.3, -0.3, 0.3));
+  EXPECT_TRUE(map::isInsidePlanarExclusion(
+    0.3, 0.3, -0.5, 0.3, -0.3, 0.3));
+  EXPECT_TRUE(map::isInsidePlanarExclusion(
+    0.0, 0.0, -0.5, 0.3, -0.3, 0.3));
+}
+
+TEST(InputPointFilter, PlanarRobotBodyExclusionKeepsOutsidePoints)
+{
+  EXPECT_FALSE(map::isInsidePlanarExclusion(
+    -0.5001, 0.0, -0.5, 0.3, -0.3, 0.3));
+  EXPECT_FALSE(map::isInsidePlanarExclusion(
+    0.3001, 0.0, -0.5, 0.3, -0.3, 0.3));
+  EXPECT_FALSE(map::isInsidePlanarExclusion(
+    0.0, 0.3001, -0.5, 0.3, -0.3, 0.3));
 }
 
 TEST(TerrainHeightCost, LeavesFlatMeasuredAndNonTerrainVoxelsUnchanged)
@@ -412,6 +672,29 @@ TEST(SemanticVoxelMap, QuantizesNegativeCoordinatesWithFloor)
   EXPECT_EQ(-1, key.x);
   EXPECT_EQ(-2, key.y);
   EXPECT_EQ(0, key.z);
+}
+
+TEST(SemanticVoxelMap, UsesIndependentPlanarAndVerticalResolution)
+{
+  map::SemanticVoxelMapConfig config;
+  config.voxel_size_xy = 0.10;
+  config.voxel_size_z = 0.05;
+  map::SemanticVoxelMap voxel_map(config);
+
+  const map::VoxelKey key = voxel_map.worldToKey(0.09, 0.11, 0.09);
+  EXPECT_EQ(0, key.x);
+  EXPECT_EQ(1, key.y);
+  EXPECT_EQ(1, key.z);
+  EXPECT_DOUBLE_EQ(0.10, voxel_map.voxelSizeXY());
+  EXPECT_DOUBLE_EQ(0.05, voxel_map.voxelSizeZ());
+
+  double x = 0.0;
+  double y = 0.0;
+  double z = 0.0;
+  voxel_map.keyToWorld(key, x, y, z);
+  EXPECT_NEAR(0.05, x, 1e-12);
+  EXPECT_NEAR(0.15, y, 1e-12);
+  EXPECT_NEAR(0.075, z, 1e-12);
 }
 
 TEST(SemanticVoxelMap, FusesSemanticCostAndPersistsState)

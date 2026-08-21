@@ -13,6 +13,23 @@ publish_local_cost_cloud: true
 # cloud acquisition time. It keeps the local map's native 0.10 m voxel centers.
 global_admission_output_frame: wuba_base
 global_admission_exclude_dynamic: true
+# Direct SSMI-ready output. Both bag and simulation profiles publish the same
+# canonical semantic encoding on this interface.
+publish_ssmi_admitted_cloud: true
+ssmi_admitted_topic: /semantic_pcl/global_admitted
+ssmi_obstacle_traversability_threshold: 0.75
+# /grids_points is an already-processed grid rather than a raw range scan, so
+# only direct, confident low-cost terrain contradiction may revoke an old SSMI
+# obstacle. Missing grid cells are deliberately not treated as free space.
+enable_ssmi_obstacle_revocation: true
+ssmi_revocation_voxel_size: 0.10
+ssmi_revocation_minimum_free_frames: 5
+ssmi_revocation_minimum_free_duration: 0.5
+ssmi_revocation_free_max_traversability: 0.45
+ssmi_revocation_minimum_semantic_confidence: 0.60
+ssmi_revocation_ray_evidence_enabled: false
+ssmi_revocation_ray_endpoint_margin: 0.20
+ssmi_revocation_ray_point_stride: 2
 # /grids_points already carries measured traversability; do not replace it with
 # semantic-only terrain geometry inference.
 terrain_height_cost_enabled: false
@@ -31,7 +48,8 @@ transform_timeout: 0.2
 timing_report_frames: 50
 
 # Sparse local map. /grids_points is already sampled on an approximately 0.1 m grid.
-voxel_size: 0.10
+voxel_size_xy: 0.10
+voxel_size_z: 0.10
 decay_seconds: 0.5
 max_voxels: 300000
 # Optional spherical sensor outlier filter. <= 0 disables it. The local box
@@ -51,6 +69,9 @@ local_box_min_y: -10.0
 local_box_max_y: 10.0
 local_box_min_z: -2.0
 local_box_max_z: 4.0
+# The recorded /grids_points pipeline is already preprocessed; keep the
+# simulation-specific robot self-filter disabled for this input profile.
+robot_body_exclusion_enabled: false
 
 # Compact Top-3 semantic evidence.
 semantic_positive_update: 1.0

@@ -10,6 +10,14 @@
 namespace local3d_semantic_voxel_map
 {
 
+bool isInsidePlanarExclusion(const double x, const double y,
+                             const double minimum_x, const double maximum_x,
+                             const double minimum_y, const double maximum_y)
+{
+  return x >= minimum_x && x <= maximum_x &&
+         y >= minimum_y && y <= maximum_y;
+}
+
 namespace
 {
 float clampUnit(const float value)
@@ -33,6 +41,14 @@ SemanticVoxelMap::SemanticVoxelMap(const SemanticVoxelMapConfig& config)
   {
     config_.voxel_size = 0.10;
   }
+  if (config_.voxel_size_xy <= 0.0)
+  {
+    config_.voxel_size_xy = config_.voxel_size;
+  }
+  if (config_.voxel_size_z <= 0.0)
+  {
+    config_.voxel_size_z = config_.voxel_size;
+  }
   config_.unknown_cost = clampUnit(config_.unknown_cost);
   config_.semantic_cost_weight = clampUnit(config_.semantic_cost_weight);
   config_.semantic_risk_alpha = clampUnit(config_.semantic_risk_alpha);
@@ -54,19 +70,20 @@ void SemanticVoxelMap::setSemanticClasses(const std::vector<SemanticClass>& clas
 VoxelKey SemanticVoxelMap::worldToKey(const double x, const double y, const double z) const
 {
   VoxelKey key;
-  key.x = static_cast<std::int32_t>(std::floor(x / config_.voxel_size));
-  key.y = static_cast<std::int32_t>(std::floor(y / config_.voxel_size));
-  key.z = static_cast<std::int32_t>(std::floor(z / config_.voxel_size));
+  key.x = static_cast<std::int32_t>(std::floor(x / config_.voxel_size_xy));
+  key.y = static_cast<std::int32_t>(std::floor(y / config_.voxel_size_xy));
+  key.z = static_cast<std::int32_t>(std::floor(z / config_.voxel_size_z));
   return key;
 }
 
 void SemanticVoxelMap::keyToWorld(const VoxelKey& key,
                                   double& x, double& y, double& z) const
 {
-  const double half = config_.voxel_size * 0.5;
-  x = static_cast<double>(key.x) * config_.voxel_size + half;
-  y = static_cast<double>(key.y) * config_.voxel_size + half;
-  z = static_cast<double>(key.z) * config_.voxel_size + half;
+  const double half_xy = config_.voxel_size_xy * 0.5;
+  const double half_z = config_.voxel_size_z * 0.5;
+  x = static_cast<double>(key.x) * config_.voxel_size_xy + half_xy;
+  y = static_cast<double>(key.y) * config_.voxel_size_xy + half_xy;
+  z = static_cast<double>(key.z) * config_.voxel_size_z + half_z;
 }
 
 void SemanticVoxelMap::integrate(const VoxelKey& key,
@@ -305,21 +322,25 @@ SemanticVoxelMap::traversabilityColumns() const
   std::lock_guard<std::mutex> lock(mutex_);
   std::unordered_map<std::uint64_t, TraversabilityColumnSnapshot> columns;
   columns.reserve(voxels_.size());
-  const double half = config_.voxel_size * 0.5;
+  const double half_xy = config_.voxel_size_xy * 0.5;
+  const double half_z = config_.voxel_size_z * 0.5;
   for (const auto& entry : voxels_)
   {
     const std::uint64_t key =
       (static_cast<std::uint64_t>(static_cast<std::uint32_t>(entry.first.x)) << 32u) |
       static_cast<std::uint32_t>(entry.first.y);
-    const double z = static_cast<double>(entry.first.z) * config_.voxel_size + half;
+    const double z =
+      static_cast<double>(entry.first.z) * config_.voxel_size_z + half_z;
     const auto found = columns.find(key);
     if (found == columns.end())
     {
       TraversabilityColumnSnapshot column;
       column.x_index = entry.first.x;
       column.y_index = entry.first.y;
-      column.x = static_cast<double>(entry.first.x) * config_.voxel_size + half;
-      column.y = static_cast<double>(entry.first.y) * config_.voxel_size + half;
+      column.x =
+        static_cast<double>(entry.first.x) * config_.voxel_size_xy + half_xy;
+      column.y =
+        static_cast<double>(entry.first.y) * config_.voxel_size_xy + half_xy;
       column.z = z;
       column.traversability_cost = entry.second.traversability_cost;
       columns.emplace(key, column);
@@ -348,7 +369,7 @@ std::size_t applyTerrainHeightDiscontinuityCost(
 {
   if (!config.enabled || voxel_size <= 0.0 ||
       config.height_difference_threshold < 0.0 ||
-      config.neighborhood_radius < 0.0)
+      config.neighborhood_radius < 0.0 || config.comparison_epsilon < 0.0)
   {
     return 0u;
   }
@@ -399,7 +420,8 @@ std::size_t applyTerrainHeightDiscontinuityCost(
       discontinuity[index] = true;
     }
   };
-  const double threshold = config.height_difference_threshold;
+  const double threshold =
+    config.height_difference_threshold + config.comparison_epsilon;
   for (const auto& item : columns)
   {
     const TerrainColumn& column = item.second;
@@ -533,7 +555,17 @@ SemanticClass SemanticVoxelMap::classDescription(const std::uint32_t label) cons
 
 double SemanticVoxelMap::voxelSize() const
 {
-  return config_.voxel_size;
+  return config_.voxel_size_xy;
+}
+
+double SemanticVoxelMap::voxelSizeXY() const
+{
+  return config_.voxel_size_xy;
+}
+
+double SemanticVoxelMap::voxelSizeZ() const
+{
+  return config_.voxel_size_z;
 }
 
 bool SemanticVoxelMap::saveCsv(const std::string& path, std::string& error) const
@@ -546,7 +578,9 @@ bool SemanticVoxelMap::saveCsv(const std::string& path, std::string& error) cons
     return false;
   }
 
-  stream << "# local3d_semantic_voxel_map v2 voxel_size=" << config_.voxel_size << '\n';
+  stream << "# local3d_semantic_voxel_map v3 voxel_size_xy="
+         << config_.voxel_size_xy << " voxel_size_z=" << config_.voxel_size_z
+         << '\n';
   stream << "x,y,z,label0,loge0,label1,loge1,label2,loge2,others,"
             "semantic_cost,measured_cost,has_measured,final_cost,observations,"
             "semantic_observations,traversability_observations,last_observed\n";

@@ -20,13 +20,15 @@
 flowchart LR
     A["/grids_points<br/>wuba_base, 点云采集时间"] --> B["输入检查与裁剪<br/>有限值 / 长方体 / 高度"]
     B --> C["在点云时间查询 TF<br/>map ← wuba_base"]
-    C --> D["变换到 map_start<br/>按 0.10 m 离散化"]
+    C --> D["变换到 map_start<br/>XY 0.10 m / Z 0.05 m 离散化"]
     D --> E["单帧同 voxel 聚合<br/>语义投票 + 测量代价均值"]
     E --> F["跨帧融合<br/>Top-3 语义 + 非对称代价 EMA"]
     F --> G["3D 稀疏 voxel 地图<br/>时间衰减 + 滚动长方体清理"]
     G --> H["完整 3D 可视化输出"]
     G --> O["0.10 m 局部筛选<br/>保留全部非动态 voxel"]
     O --> P["采集时刻机器人 frame<br/>global_semantic_admission_grid"]
+    O --> Q["统一语义编码<br/>/semantic_pcl/global_admitted"]
+    Q --> R["SSMI SemanticOcTree"]
     G --> I["按 x-y 柱压缩<br/>每柱保留最高代价"]
     I --> J["map 代价云<br/>供 FAR localPlanner"]
     I --> K["wuba_base 代价云<br/>供局部终点生成器"]
@@ -167,10 +169,26 @@ T_map_start_wuba(t) = inverse(T_map_wuba(t0)) * T_map_wuba(t)
 1. PointCloud2 缓冲区和字段读取检查；
 2. `x/y/z` 有限值检查；
 3. 可选 `max_range` 球形量程检查；
-4. 以输入点云坐标系表达的局部长方体检查；
-5. 变换到 `map_start`；
-6. `min_z/max_z` 地图坐标高度检查；
-7. 语义与测量代价有效性检查。
+4. 可选机器人近身二维排除矩形检查；
+5. 以输入点云坐标系表达的局部长方体检查；
+6. 变换到 `map_start`；
+7. `min_z/max_z` 地图坐标高度检查；
+8. 语义与测量代价有效性检查。
+
+仿真 profile 在第 4 步启用：
+
+```yaml
+robot_body_exclusion_enabled: true
+robot_body_exclusion_min_x: -0.5
+robot_body_exclusion_max_x:  0.3
+robot_body_exclusion_min_y: -0.3
+robot_body_exclusion_max_y:  0.3
+```
+
+该矩形在输入 `base_link` 点云中判断，并对所有 z 生效。相机位于机器人前部，因而
+负 x 后方排除距离大于正 x 前方距离。裁剪发生在单帧 voxel 聚合和地形高度柱建立
+之前，机器人腿部或机身回波不会影响局部地图、高程边界障碍判断以及 SSMI 输出。
+数据包 `/grids_points` profile 明确关闭该过滤器。
 
 ### 5.1 当前滚动长方体
 
@@ -214,12 +232,13 @@ local_box_max_y: 8.0
 
 ## 6. Voxel 化与单帧聚合
 
-地图采用稀疏哈希表。当前 `voxel_size: 0.10`，位置到索引的计算为：
+地图采用稀疏哈希表。仿真配置使用 `voxel_size_xy: 0.10` 和
+`voxel_size_z: 0.05`；bag 配置的 XYZ 均为 `0.10 m`。位置到索引的计算为：
 
 ```text
-kx = floor(x / voxel_size)
-ky = floor(y / voxel_size)
-kz = floor(z / voxel_size)
+kx = floor(x / voxel_size_xy)
+ky = floor(y / voxel_size_xy)
+kz = floor(z / voxel_size_z)
 ```
 
 同一帧中落入同一 voxel 的多个点不会逐个更新历史地图，而是先形成一个
@@ -375,10 +394,13 @@ x, y, z, intensity
 | `/local_3d_semantic_voxel_map/traversability_voxels` | `visualization_msgs/Marker` | `map_start` | 完整 3D voxel，绿-黄-红代价着色 |
 | `/local_3d_semantic_voxel_map/voxel_cloud` | `sensor_msgs/PointCloud2` | `map_start` | 完整 3D 融合结果及所有语义/代价字段 |
 | `/local_3d_semantic_voxel_map/global_semantic_admission_grid` | `sensor_msgs/PointCloud2` | `wuba_base`（bag）/`base_link`（仿真） | 同一 0.10 m 局部快照剔除动态物体后的结果，字段兼容 `/grids_points` |
+| `/semantic_pcl/global_admitted` | `sensor_msgs/PointCloud2` | 同上 | 同一筛选快照的 SSMI 直接输入，字段为 `x/y/z/rgb/semantic_color`，两种来源统一语义编码 |
 | `/local_3d_semantic_voxel_map/confirmed` | `sensor_msgs/PointCloud2` | 同上 | 与筛选输出相同，便于调试 |
 | `/local_3d_semantic_voxel_map/rejected_dynamic` | `sensor_msgs/PointCloud2` | 同上 | 默认排除但仍保留在完整局部地图的动态标签点 |
 | `/local_3d_semantic_voxel_map/rejected_unknown` | `sensor_msgs/PointCloud2` | 同上 | 当前为空；未知非动态点也会保留 |
-| `candidates/rejected_rear/revocation_*` | `sensor_msgs/PointCloud2` | 同上 | 兼容保留的空调试云；当前筛选器不维护这些状态 |
+| `/local_3d_semantic_voxel_map/revocation_candidates` | `sensor_msgs/PointCloud2` | 同上 | 已送入 SSMI 的旧障碍中，正在累计明确自由反证的 voxel |
+| `/local_3d_semantic_voxel_map/revoked_free` | `sensor_msgs/PointCloud2` | 同上 | 满足多帧自由反证后，要求 SSMI 精确删除的旧障碍 voxel |
+| `candidates/rejected_rear/revoked_reclassified` | `sensor_msgs/PointCloud2` | 同上 | 当前策略下为空的兼容调试云 |
 | `/local_3d_semantic_voxel_map/traversability_cost_cloud` | `sensor_msgs/PointCloud2` | `map` | 柱压缩后的全局代价云，供 FAR |
 | `/local_3d_semantic_voxel_map/traversability_cost_cloud_wuba` | `sensor_msgs/PointCloud2` | `wuba_base` | 同一代价云在最新点云时刻变换到车体坐标系，供局部终点选择 |
 
@@ -402,8 +424,8 @@ observations, semantic_observations, traversability_observations
 完整保留在 `voxel_cloud` 供局部避障，只从 admission 输出中排除。
 
 `traversability` 不再决定某个非动态点是否进入该话题，而是决定其下游用途：普通
-地面保持低代价；仿真中高度突变超过 0.15 m 的地形边界被提升到 1.0，SSMI adapter
-再以 0.75 为障碍阈值将这些高代价点编码为墙体障碍。
+地面保持低代价；仿真中高度突变超过 0.15 m 的地形边界被提升到 1.0。本节点直接
+以 0.75 为默认障碍阈值，将这些高代价点在 SSMI 输出中编码为标准障碍。
 
 筛选点使用该帧采集时间的机器人位姿，从 `map_start` 变换到 `wuba_base`（bag）或
 `base_link`（仿真）。坐标、frame 和 `header.stamp` 一起缓存；定时器重发时不会按
@@ -414,14 +436,32 @@ x(float32), y(float32), z(float32), traversability(float32),
 semantic_lable(uint32)
 ```
 
+同一份筛选结果还会在本节点内直接转换为 SSMI 的
+`x/y/z/rgb/semantic_color` 点云。仿真输入颜色和数据包输入颜色只在输入解析阶段各自
+处理；进入融合地图后均为规范标签，输出给 SSMI 时再使用统一的完整规范语义编码。
+`rgb` 与 `semantic_color` 的位模式完全相同。最终通行代价不低于配置阈值的点会被
+覆盖为规范障碍编码，因此 SSMI 不需要读取额外的 traversability 字段。
+
 ### 12.2 与持久化全局地图的边界
 
 当前节点不再执行 8 帧稳定性确认、0.40 m 再体素化、候选超时、后方走廊或反向
-撤销状态机。一个点是否出现在筛选话题中，完全由当前缓存的局部 voxel 快照决定；
-局部衰减或新观测改变快照后，下一帧筛选结果自然随之改变。
+插入状态机。一个非动态点是否出现在筛选话题中，仍完全由当前局部 voxel 快照决定。
 
-如果 SSMI/OctoMap 订阅该话题并长期累计，永久化、自由空间清除及误分类撤销策略
-属于下游全局建图器，不能再把本话题本身理解为“已经稳定确认的永久静态地图”。
+为了修正 SSMI 中已经累计的感知误判，节点另外维护一个与 SSMI 0.10 m 分辨率一致的
+障碍镜像。只有静态标签 `2-8` 或最终代价不低于 `0.75` 的已输出点进入该镜像。
+撤销遵循以下约束：
+
+1. 仅从局部地图消失、时间衰减或离开滚动窗口，不构成自由证据；
+2. 标签 `11-18` 出现在旧障碍位置表示动态遮挡，会打断而不是推进撤销；
+3. 置信度不低于 `0.60`、代价不高于 `0.45` 的地形标签 `0/1/9` 是直接反证；
+4. 仿真原始深度射线在距端点至少 `0.20 m` 前穿过旧 voxel，也是直接反证；
+5. 默认需要至少 5 个不同采集帧且持续 `0.5 s`；满足后通过 `revoked_free` 删除；
+6. 撤销当帧从 admitted 快照暂时省略同一 SSMI key，避免两个独立 ROS topic 的
+   到达顺序造成“先插入新地形、后又被撤销消息删除”的竞争。
+
+仿真 profile 启用射线反证，用于清除灰色伪静态移动物体留下的轨迹。bag 的
+`/grids_points` 是处理后的网格而不是原始量测束，因此关闭射线反证，只接受明确的
+低代价地形反证。SSMI 仍关闭普通 raycast clearing，只消费上述确认后的精确撤销。
 
 ## 13. 测试局部终点生成器
 

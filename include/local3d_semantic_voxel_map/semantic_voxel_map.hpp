@@ -52,7 +52,11 @@ enum class TraversabilityFusionMethod
 
 struct SemanticVoxelMapConfig
 {
+  // Legacy isotropic resolution.  The axis-specific values inherit this when
+  // left non-positive so existing callers and YAML files keep their behavior.
   double voxel_size = 0.10;
+  double voxel_size_xy = 0.0;
+  double voxel_size_z = 0.0;
   double decay_seconds = 0.5;
   std::size_t max_voxels = 500000;
   float unknown_cost = 0.5f;
@@ -128,9 +132,14 @@ struct TerrainHeightCostConfig
   bool enabled = false;
   double height_difference_threshold = 0.15;
   double neighborhood_radius = 0.20;
+  double comparison_epsilon = 1e-6;
   float obstacle_cost = 1.0f;
   bool only_without_measured_traversability = true;
 };
+
+bool isInsidePlanarExclusion(double x, double y,
+                             double minimum_x, double maximum_x,
+                             double minimum_y, double maximum_y);
 
 std::size_t applyTerrainHeightDiscontinuityCost(
   std::vector<VoxelSnapshot>& voxels, double voxel_size,
@@ -165,7 +174,11 @@ public:
 
   float classCost(std::uint32_t label) const;
   SemanticClass classDescription(std::uint32_t label) const;
+  // Kept for source compatibility; horizontal resolution is the historical
+  // voxel size used by planar consumers.
   double voxelSize() const;
+  double voxelSizeXY() const;
+  double voxelSizeZ() const;
 
   bool saveCsv(const std::string& path, std::string& error) const;
   bool loadCsv(const std::string& path, std::string& error);

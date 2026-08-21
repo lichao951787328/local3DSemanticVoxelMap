@@ -1,5 +1,7 @@
 #include "local3d_semantic_voxel_map/semantic_voxel_map.hpp"
 #include "local3d_semantic_voxel_map/global_semantic_admission.hpp"
+#include "local3d_semantic_voxel_map/obstacle_revocation.hpp"
+#include "local3d_semantic_voxel_map/ssmi_semantic_encoding.hpp"
 
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/TransformStamped.h>
@@ -27,6 +29,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace local3d_semantic_voxel_map
@@ -178,6 +181,10 @@ public:
   {
     SemanticVoxelMapConfig map_config;
     private_nh_.param("voxel_size", map_config.voxel_size, 0.10);
+    private_nh_.param("voxel_size_xy", map_config.voxel_size_xy,
+                      map_config.voxel_size);
+    private_nh_.param("voxel_size_z", map_config.voxel_size_z,
+                      map_config.voxel_size);
     private_nh_.param("decay_seconds", map_config.decay_seconds, 0.5);
     int max_voxels = 500000;
     private_nh_.param("max_voxels", max_voxels, 500000);
@@ -239,12 +246,55 @@ public:
                                    admission_output_frame_, "");
     private_nh_.param("global_admission_exclude_dynamic",
                       admission_exclude_dynamic_, true);
+    private_nh_.param("publish_ssmi_admitted_cloud",
+                      publish_ssmi_admitted_cloud_, true);
+    private_nh_.param<std::string>("ssmi_admitted_topic",
+                                   ssmi_admitted_topic_,
+                                   "/semantic_pcl/global_admitted");
+    private_nh_.param("ssmi_obstacle_traversability_threshold",
+                      ssmi_obstacle_traversability_threshold_, 0.75f);
+    private_nh_.param("enable_ssmi_obstacle_revocation",
+                      enable_ssmi_obstacle_revocation_, true);
+    ObstacleRevocationConfig revocation_config;
+    private_nh_.param("ssmi_revocation_voxel_size",
+                      revocation_config.voxel_size, 0.10);
+    int revocation_minimum_frames = 5;
+    private_nh_.param("ssmi_revocation_minimum_free_frames",
+                      revocation_minimum_frames, 5);
+    revocation_config.minimum_free_frames = revocation_minimum_frames <= 0 ?
+      0u : static_cast<std::size_t>(revocation_minimum_frames);
+    private_nh_.param("ssmi_revocation_minimum_free_duration",
+                      revocation_config.minimum_free_duration, 0.5);
+    private_nh_.param("ssmi_revocation_free_max_traversability",
+                      revocation_config.free_max_traversability, 0.45f);
+    revocation_config.obstacle_min_traversability =
+      ssmi_obstacle_traversability_threshold_;
+    private_nh_.param("ssmi_revocation_minimum_semantic_confidence",
+                      revocation_config.minimum_semantic_confidence, 0.60f);
+    private_nh_.param("ssmi_revocation_ray_endpoint_margin",
+                      revocation_config.ray_endpoint_margin, 0.20);
+    private_nh_.param("ssmi_revocation_ray_evidence_enabled",
+                      ssmi_revocation_ray_evidence_enabled_, false);
+    private_nh_.param("ssmi_revocation_ray_point_stride",
+                      ssmi_revocation_ray_point_stride_, 2);
+    if (ssmi_revocation_ray_point_stride_ <= 0)
+    {
+      throw std::runtime_error(
+        "~ssmi_revocation_ray_point_stride must be positive");
+    }
+    if (enable_ssmi_obstacle_revocation_)
+    {
+      obstacle_revocation_tracker_.reset(
+        new ObstacleRevocationTracker(revocation_config));
+    }
     private_nh_.param("terrain_height_cost_enabled",
                       terrain_height_cost_config_.enabled, false);
     private_nh_.param("terrain_height_difference_threshold",
                       terrain_height_cost_config_.height_difference_threshold, 0.15);
     private_nh_.param("terrain_height_neighborhood_radius",
                       terrain_height_cost_config_.neighborhood_radius, 0.20);
+    private_nh_.param("terrain_height_comparison_epsilon",
+                      terrain_height_cost_config_.comparison_epsilon, 1e-6);
     private_nh_.param("terrain_height_obstacle_cost",
                       terrain_height_cost_config_.obstacle_cost, 1.0f);
     private_nh_.param("default_semantic_confidence", default_confidence_, 1.0f);
@@ -259,6 +309,16 @@ public:
     private_nh_.param("local_box_max_y", local_box_max_y_, 12.0);
     private_nh_.param("local_box_min_z", local_box_min_z_, -2.0);
     private_nh_.param("local_box_max_z", local_box_max_z_, 4.0);
+    private_nh_.param("robot_body_exclusion_enabled",
+                      robot_body_exclusion_enabled_, false);
+    private_nh_.param("robot_body_exclusion_min_x",
+                      robot_body_exclusion_min_x_, -0.5);
+    private_nh_.param("robot_body_exclusion_max_x",
+                      robot_body_exclusion_max_x_, 0.3);
+    private_nh_.param("robot_body_exclusion_min_y",
+                      robot_body_exclusion_min_y_, -0.3);
+    private_nh_.param("robot_body_exclusion_max_y",
+                      robot_body_exclusion_max_y_, 0.3);
     private_nh_.param("transform_timeout", transform_timeout_, 0.2);
     private_nh_.param("publish_rate", publish_rate_, 2.0);
     private_nh_.param("marker_alpha", marker_alpha_, 0.85f);
@@ -301,14 +361,33 @@ public:
       ROS_WARN("Both local_box_enabled and local_radius are set; the local box "
                "takes precedence");
     }
+    if (robot_body_exclusion_enabled_ &&
+        (robot_body_exclusion_min_x_ >= robot_body_exclusion_max_x_ ||
+         robot_body_exclusion_min_y_ >= robot_body_exclusion_max_y_))
+    {
+      throw std::runtime_error(
+        "robot body exclusion minimum bounds must be smaller than maximum bounds");
+    }
     if (terrain_height_cost_config_.height_difference_threshold < 0.0 ||
         terrain_height_cost_config_.neighborhood_radius < 0.0 ||
+        terrain_height_cost_config_.comparison_epsilon < 0.0 ||
         terrain_height_cost_config_.obstacle_cost < 0.0f ||
         terrain_height_cost_config_.obstacle_cost > 1.0f)
     {
       throw std::runtime_error(
         "terrain height thresholds/radius must be non-negative and obstacle cost "
         "must be in [0, 1]");
+    }
+    if (ssmi_obstacle_traversability_threshold_ < 0.0f ||
+        ssmi_obstacle_traversability_threshold_ > 1.0f)
+    {
+      throw std::runtime_error(
+        "~ssmi_obstacle_traversability_threshold must be in [0, 1]");
+    }
+    if (publish_ssmi_admitted_cloud_ && ssmi_admitted_topic_.empty())
+    {
+      throw std::runtime_error(
+        "~ssmi_admitted_topic must be non-empty when direct SSMI output is enabled");
     }
     if (use_initial_pose_reference_ &&
         (reference_frame_.empty() || reference_frame_ == global_frame_))
@@ -330,6 +409,11 @@ public:
       "traversability_cost_cloud_wuba", 1, true);
     global_admission_pub_ = private_nh_.advertise<sensor_msgs::PointCloud2>(
       "global_semantic_admission_grid", 1, true);
+    if (publish_ssmi_admitted_cloud_)
+    {
+      ssmi_admitted_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(
+        ssmi_admitted_topic_, 1, true);
+    }
     candidates_pub_ = private_nh_.advertise<sensor_msgs::PointCloud2>(
       "candidates", 1, true);
     confirmed_pub_ = private_nh_.advertise<sensor_msgs::PointCloud2>(
@@ -359,11 +443,11 @@ public:
     publish_timer_ = nh_.createTimer(ros::Duration(timer_period),
                                      &SemanticVoxelMapNode::timerCallback, this);
     ROS_INFO("Semantic voxel map: input=%s tracking_frame=%s map_frame=%s "
-             "voxel_size=%.3f, "
+             "voxel_size_xy=%.3f voxel_size_z=%.3f, "
              "layout=%s pixel sampling=%dx%d stride=(%d,%d) offset=(%d,%d), "
              "point_stride=%d",
              input_topic_.c_str(), global_frame_.c_str(), mapFrame().c_str(),
-             map_->voxelSize(),
+             map_->voxelSizeXY(), map_->voxelSizeZ(),
              input_layout_.c_str(),
              input_image_width_, input_image_height_, pixel_stride_x_,
              pixel_stride_y_, pixel_offset_x_, pixel_offset_y_, point_stride_);
@@ -377,16 +461,36 @@ public:
                local_box_min_z_, local_box_max_z_,
                max_range_ > 0.0 ? std::to_string(max_range_).c_str() : "disabled");
     }
-    ROS_INFO("Local semantic admission filter: output_frame=%s, voxel=%.2f m, "
+    if (robot_body_exclusion_enabled_)
+    {
+      ROS_INFO("Robot body input exclusion in cloud frame: "
+               "x=[%.2f, %.2f], y=[%.2f, %.2f] m (all z)",
+               robot_body_exclusion_min_x_, robot_body_exclusion_max_x_,
+               robot_body_exclusion_min_y_, robot_body_exclusion_max_y_);
+    }
+    ROS_INFO("Local semantic admission filter: output_frame=%s, "
+             "voxel=(%.2f, %.2f, %.2f) m, "
              "all non-dynamic voxels are retained, exclude_dynamic=%s",
              (admission_output_frame_.empty() ? local_cost_frame_ :
               admission_output_frame_).c_str(),
-             map_->voxelSize(),
+             map_->voxelSizeXY(), map_->voxelSizeXY(), map_->voxelSizeZ(),
              admission_exclude_dynamic_ ? "true" : "false");
-    ROS_INFO("Missing-cost terrain height inference: %s, dz>%.2f m within "
-             "%.2f m -> cost %.2f (terrain labels 0/1/9 only)",
+    if (publish_ssmi_admitted_cloud_)
+    {
+      ROS_INFO("Direct SSMI semantic cloud: topic=%s, canonical semantic encoding, "
+               "cost >= %.2f encoded as an obstacle",
+               ssmi_admitted_topic_.c_str(),
+               ssmi_obstacle_traversability_threshold_);
+    }
+    ROS_INFO("SSMI obstacle revocation: %s, ray evidence=%s, ray stride=%d",
+             enable_ssmi_obstacle_revocation_ ? "enabled" : "disabled",
+             ssmi_revocation_ray_evidence_enabled_ ? "enabled" : "disabled",
+             ssmi_revocation_ray_point_stride_);
+    ROS_INFO("Missing-cost terrain height inference: %s, dz>%.2f m + %.1e "
+             "within %.2f m -> cost %.2f (terrain labels 0/1/9 only)",
              terrain_height_cost_config_.enabled ? "enabled" : "disabled",
              terrain_height_cost_config_.height_difference_threshold,
+             terrain_height_cost_config_.comparison_epsilon,
              terrain_height_cost_config_.neighborhood_radius,
              terrain_height_cost_config_.obstacle_cost);
   }
@@ -654,8 +758,10 @@ private:
       (point_count + static_cast<std::size_t>(point_stride_) - 1u) /
         static_cast<std::size_t>(point_stride_);
     scan_voxels.reserve(sampled_capacity / 2u + 1u);
+    std::unordered_set<VoxelKey, VoxelKeyHash> ray_free_evidence;
     std::size_t sampled_points = 0u;
     std::size_t valid_points = 0u;
+    std::size_t robot_body_rejected_points = 0u;
 
     auto process_point = [&](const std::size_t point_offset)
     {
@@ -679,6 +785,17 @@ private:
       {
         return true;
       }
+      // Apply this in the incoming cloud frame before voxel fusion. For the
+      // simulation profile that frame is base_link, so articulated robot-body
+      // returns cannot affect semantic evidence or terrain-height inference.
+      if (robot_body_exclusion_enabled_ && isInsidePlanarExclusion(
+            sensor_x, sensor_y,
+            robot_body_exclusion_min_x_, robot_body_exclusion_max_x_,
+            robot_body_exclusion_min_y_, robot_body_exclusion_max_y_))
+      {
+        ++robot_body_rejected_points;
+        return true;
+      }
       if (local_box_enabled_ &&
           (sensor_x < local_box_min_x_ || sensor_x > local_box_max_x_ ||
            sensor_y < local_box_min_y_ || sensor_y > local_box_max_y_ ||
@@ -695,6 +812,15 @@ private:
       if (z < min_z_ || z > max_z_)
       {
         return true;
+      }
+
+      if (obstacle_revocation_tracker_ &&
+          ssmi_revocation_ray_evidence_enabled_ &&
+          sampled_points %
+            static_cast<std::size_t>(ssmi_revocation_ray_point_stride_) == 0u)
+      {
+        obstacle_revocation_tracker_->collectTrackedRayEvidence(
+          origin_x, origin_y, origin_z, x, y, z, ray_free_evidence);
       }
 
       std::uint32_t label = kInvalidSemanticLabel;
@@ -859,11 +985,11 @@ private:
       ROS_INFO(
         "Map update timing over %zu depth frames: avg=%.2f ms, min=%.2f ms, "
         "max=%.2f ms; latest sampled=%zu/%zu, valid=%zu, scan_voxels=%zu, "
-        "expired=%zu, map_voxels=%zu",
+        "body_rejected=%zu, expired=%zu, map_voxels=%zu",
         timing_frame_count_, timing_elapsed_sum_ms_ / timing_frame_count_,
         timing_elapsed_min_ms_, timing_elapsed_max_ms_, sampled_points,
-        point_count, valid_points, scan_voxels.size(), temporally_removed,
-        map_->size());
+        point_count, valid_points, scan_voxels.size(),
+        robot_body_rejected_points, temporally_removed, map_->size());
       timing_frame_count_ = 0u;
       timing_elapsed_sum_ms_ = 0.0;
       timing_elapsed_min_ms_ = std::numeric_limits<double>::max();
@@ -871,6 +997,7 @@ private:
     }
     // Materialize and commit one complete PointCloud2 after the frame update.
     // The timer only republishes this cached message.
+    pending_ray_free_evidence_ = std::move(ray_free_evidence);
     publish(message->header.stamp, true);
   }
 
@@ -895,7 +1022,7 @@ private:
     std::vector<VoxelSnapshot> voxels = map_->snapshot();
     const std::size_t derived_height_obstacles =
       applyTerrainHeightDiscontinuityCost(
-        voxels, map_->voxelSize(), terrain_height_cost_config_);
+        voxels, map_->voxelSizeXY(), terrain_height_cost_config_);
     const std::vector<TraversabilityColumnSnapshot> cost_columns =
       projectTraversabilityColumns(voxels);
     if (commit_voxel_snapshot && derived_height_obstacles > 0u)
@@ -911,9 +1038,9 @@ private:
     semantic_marker.type = visualization_msgs::Marker::CUBE_LIST;
     semantic_marker.action = visualization_msgs::Marker::ADD;
     semantic_marker.pose.orientation.w = 1.0;
-    semantic_marker.scale.x = map_->voxelSize();
-    semantic_marker.scale.y = map_->voxelSize();
-    semantic_marker.scale.z = map_->voxelSize();
+    semantic_marker.scale.x = map_->voxelSizeXY();
+    semantic_marker.scale.y = map_->voxelSizeXY();
+    semantic_marker.scale.z = map_->voxelSizeZ();
 
     visualization_msgs::Marker cost_marker = semantic_marker;
     cost_marker.ns = "traversability_voxels";
@@ -1063,6 +1190,58 @@ private:
     return cloud;
   }
 
+  sensor_msgs::PointCloud2 makeSsmiAdmissionCloud(
+    const std::vector<AdmissionPoint>& points, const std::string& frame_id,
+    const ros::Time& stamp) const
+  {
+    // Match PointXYZRGBSemantic's aligned PCL wire layout exactly:
+    // xyz at 0/4/8, the PointXYZ padding word at 12, rgb at 16,
+    // semantic_color at 20, and an aligned 32-byte point stride.
+    sensor_msgs::PointCloud2 cloud;
+    cloud.header.frame_id = frame_id;
+    cloud.header.stamp = stamp;
+    cloud.height = 1u;
+    cloud.width = static_cast<std::uint32_t>(points.size());
+    cloud.fields.resize(5u);
+    const std::array<std::string, 5> names =
+      {{"x", "y", "z", "rgb", "semantic_color"}};
+    const std::array<std::uint32_t, 5> offsets = {{0u, 4u, 8u, 16u, 20u}};
+    for (std::size_t index = 0u; index < cloud.fields.size(); ++index)
+    {
+      cloud.fields[index].name = names[index];
+      cloud.fields[index].offset = offsets[index];
+      cloud.fields[index].datatype = sensor_msgs::PointField::FLOAT32;
+      cloud.fields[index].count = 1u;
+    }
+    cloud.is_bigendian = false;
+    cloud.point_step = 32u;
+    cloud.row_step = cloud.point_step * cloud.width;
+    cloud.data.assign(cloud.row_step, 0u);
+    cloud.is_dense = true;
+
+    for (std::size_t index = 0u; index < points.size(); ++index)
+    {
+      const AdmissionPoint& point = points[index];
+      const float x = static_cast<float>(point.x);
+      const float y = static_cast<float>(point.y);
+      const float z = static_cast<float>(point.z);
+      const SemanticRgb color = ssmiSemanticColor(
+        point.label, point.traversability,
+        ssmi_obstacle_traversability_threshold_);
+      const std::uint32_t packed_bits = packSemanticRgb(color);
+      float packed_color = 0.0f;
+      std::memcpy(&packed_color, &packed_bits, sizeof(float));
+
+      std::uint8_t* output = cloud.data.data() + index * cloud.point_step;
+      std::memcpy(output + 0u, &x, sizeof(float));
+      std::memcpy(output + 4u, &y, sizeof(float));
+      std::memcpy(output + 8u, &z, sizeof(float));
+      std::memcpy(output + 16u, &packed_color, sizeof(float));
+      std::memcpy(output + 20u, &packed_color, sizeof(float));
+    }
+    return cloud;
+  }
+
   void updateAdmissionSnapshot(const std::vector<VoxelSnapshot>& voxels,
                                const ros::Time& stamp)
   {
@@ -1098,23 +1277,50 @@ private:
           stamp.toSec(), output_frame.c_str(), mapFrame().c_str(), exception.what());
         latest_admission_result_ = AdmissionFrameResult();
         latest_admission_frame_ = output_frame;
+        pending_ray_free_evidence_.clear();
         return;
       }
     }
+
+    ObstacleRevocationResult revocations;
+    if (obstacle_revocation_tracker_)
+    {
+      revocations = obstacle_revocation_tracker_->update(
+        voxels, pending_ray_free_evidence_, stamp);
+    }
+    pending_ray_free_evidence_.clear();
+
+    const auto transform_admission_point = [&map_to_output](
+      const double x, const double y, const double z,
+      const float traversability, const std::uint32_t label)
+    {
+      const tf2::Vector3 transformed = map_to_output * tf2::Vector3(x, y, z);
+      AdmissionPoint point;
+      point.x = transformed.x();
+      point.y = transformed.y();
+      point.z = transformed.z();
+      point.traversability = traversability;
+      point.label = label;
+      return point;
+    };
 
     result.confirmed.reserve(voxels.size());
     result.rejected_dynamic.reserve(voxels.size() / 8u);
     result.rejected_unknown.reserve(voxels.size() / 2u);
     for (const VoxelSnapshot& voxel : voxels)
     {
-      AdmissionPoint point;
-      const tf2::Vector3 output_point = map_to_output *
-        tf2::Vector3(voxel.x, voxel.y, voxel.z);
-      point.x = output_point.x();
-      point.y = output_point.y();
-      point.z = output_point.z();
-      point.traversability = voxel.traversability_cost;
-      point.label = voxel.label;
+      if (obstacle_revocation_tracker_ &&
+          revocations.revoked_keys.count(
+            obstacle_revocation_tracker_->keyFor(
+              voxel.x, voxel.y, voxel.z)) != 0u)
+      {
+        // Avoid a same-stamp race between independent insertion and revocation
+        // topics. This key is omitted for the revocation frame and may be
+        // inserted with its new terrain semantic on the next acquisition.
+        continue;
+      }
+      const AdmissionPoint point = transform_admission_point(
+        voxel.x, voxel.y, voxel.z, voxel.traversability_cost, voxel.label);
 
       const LocalAdmissionDecision decision = classifyLocalAdmissionVoxel(
         voxel.label, admission_exclude_dynamic_);
@@ -1124,6 +1330,25 @@ private:
         continue;
       }
       result.confirmed.push_back(point);
+    }
+    result.revocation_candidates.reserve(revocations.candidates.size());
+    for (const ObstacleRevocationPoint& candidate : revocations.candidates)
+    {
+      result.revocation_candidates.push_back(transform_admission_point(
+        candidate.x, candidate.y, candidate.z,
+        candidate.traversability, candidate.label));
+    }
+    result.revoked_free.reserve(revocations.revoked_free.size());
+    for (const ObstacleRevocationPoint& revoked : revocations.revoked_free)
+    {
+      result.revoked_free.push_back(transform_admission_point(
+        revoked.x, revoked.y, revoked.z,
+        revoked.traversability, revoked.label));
+    }
+    if (!result.revoked_free.empty())
+    {
+      ROS_INFO("Confirmed %zu stale SSMI obstacle voxels as free at %.6f",
+               result.revoked_free.size(), stamp.toSec());
     }
     latest_admission_result_ = std::move(result);
     latest_admission_frame_ = output_frame;
@@ -1141,6 +1366,14 @@ private:
       mapFrame() : latest_admission_frame_;
     global_admission_pub_.publish(
       makeAdmissionCloud(latest_admission_result_.confirmed, frame_id, stamp));
+    if (publish_ssmi_admitted_cloud_)
+    {
+      // This is one complete PointCloud2 snapshot. Both color fields, the
+      // robot-relative coordinates, frame, and acquisition stamp come from the
+      // same committed local-map frame; timer repeats do not refresh any part.
+      ssmi_admitted_pub_.publish(makeSsmiAdmissionCloud(
+        latest_admission_result_.confirmed, frame_id, stamp));
+    }
     candidates_pub_.publish(
       makeAdmissionCloud(latest_admission_result_.candidates, frame_id, stamp));
     confirmed_pub_.publish(
@@ -1284,6 +1517,12 @@ private:
     latest_admission_result_ = AdmissionFrameResult();
     latest_admission_frame_.clear();
     latest_processed_frame_stamp_ = ros::Time();
+    pending_ray_free_evidence_.clear();
+    if (clear_reference && obstacle_revocation_tracker_)
+    {
+      // SSMI also starts a new mapping session after a rosbag time rewind.
+      obstacle_revocation_tracker_->clear();
+    }
     {
       std::lock_guard<std::mutex> snapshot_lock(snapshot_mutex_);
       have_voxel_cloud_snapshot_ = false;
@@ -1322,6 +1561,7 @@ private:
   tf2_ros::TransformListener tf_listener_;
   tf2_ros::StaticTransformBroadcaster reference_tf_broadcaster_;
   std::unique_ptr<SemanticVoxelMap> map_;
+  std::unique_ptr<ObstacleRevocationTracker> obstacle_revocation_tracker_;
   ros::Subscriber cloud_sub_;
   ros::Publisher semantic_marker_pub_;
   ros::Publisher cost_marker_pub_;
@@ -1329,6 +1569,7 @@ private:
   ros::Publisher cost_cloud_pub_;
   ros::Publisher local_cost_cloud_pub_;
   ros::Publisher global_admission_pub_;
+  ros::Publisher ssmi_admitted_pub_;
   ros::Publisher candidates_pub_;
   ros::Publisher confirmed_pub_;
   ros::Publisher rejected_dynamic_pub_;
@@ -1351,14 +1592,20 @@ private:
   std::string map_file_;
   std::string local_cost_frame_ = "wuba_base";
   std::string admission_output_frame_;
+  std::string ssmi_admitted_topic_ = "/semantic_pcl/global_admitted";
   std::string latest_admission_frame_;
   std::string input_layout_ = "image";
   std::unordered_map<std::uint32_t, std::uint32_t> semantic_label_remap_;
   bool publish_local_cost_cloud_ = false;
   bool use_initial_pose_reference_ = false;
   bool admission_exclude_dynamic_ = true;
+  bool publish_ssmi_admitted_cloud_ = true;
+  bool enable_ssmi_obstacle_revocation_ = true;
+  bool ssmi_revocation_ray_evidence_enabled_ = false;
+  int ssmi_revocation_ray_point_stride_ = 2;
   TerrainHeightCostConfig terrain_height_cost_config_;
   float default_confidence_ = 1.0f;
+  float ssmi_obstacle_traversability_threshold_ = 0.75f;
   double max_range_ = 15.0;
   double min_z_ = -std::numeric_limits<double>::max();
   double max_z_ = std::numeric_limits<double>::max();
@@ -1370,6 +1617,11 @@ private:
   double local_box_max_y_ = 12.0;
   double local_box_min_z_ = -2.0;
   double local_box_max_z_ = 4.0;
+  bool robot_body_exclusion_enabled_ = false;
+  double robot_body_exclusion_min_x_ = -0.5;
+  double robot_body_exclusion_max_x_ = 0.3;
+  double robot_body_exclusion_min_y_ = -0.3;
+  double robot_body_exclusion_max_y_ = 0.3;
   double transform_timeout_ = 0.2;
   double publish_rate_ = 2.0;
   float marker_alpha_ = 0.85f;
@@ -1386,6 +1638,7 @@ private:
   tf2::Transform initial_reference_to_global_;
   bool have_initial_reference_ = false;
   AdmissionFrameResult latest_admission_result_;
+  std::unordered_set<VoxelKey, VoxelKeyHash> pending_ray_free_evidence_;
   std::mutex snapshot_mutex_;
   sensor_msgs::PointCloud2 voxel_cloud_snapshot_;
   bool have_voxel_cloud_snapshot_ = false;

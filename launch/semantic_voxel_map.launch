@@ -4,6 +4,7 @@
   <arg name="global_frame" default="world"/>
   <arg name="reference_frame" default="map_start"/>
   <arg name="robot_frame" default="base_link"/>
+  <arg name="ssmi_topic" default="/semantic_pcl/global_admitted"/>
   <arg name="rviz" default="false"/>
 
   <node pkg="local3d_semantic_voxel_map"
@@ -16,6 +17,7 @@
     <param name="global_frame" value="$(arg global_frame)"/>
     <param name="reference_frame" value="$(arg reference_frame)"/>
     <param name="global_admission_output_frame" value="$(arg robot_frame)"/>
+    <param name="ssmi_admitted_topic" value="$(arg ssmi_topic)"/>
   </node>
 
   <node if="$(arg rviz)" pkg="rviz" type="rviz" name="semantic_voxel_rviz"

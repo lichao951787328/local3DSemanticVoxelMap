@@ -41,8 +41,10 @@ include_directories(
 
 add_library(semantic_voxel_map
   src/global_semantic_admission.cpp
+  src/obstacle_revocation.cpp
   src/semantic_fusion.cpp
   src/semantic_voxel_map.cpp
+  src/ssmi_semantic_encoding.cpp
 )
 target_link_libraries(semantic_voxel_map ${catkin_LIBRARIES})
 add_dependencies(semantic_voxel_map ${catkin_EXPORTED_TARGETS})
@@ -65,6 +67,7 @@ target_link_libraries(test_local_goal_selector
 add_dependencies(test_local_goal_selector ${catkin_EXPORTED_TARGETS})
 
 catkin_install_python(PROGRAMS
+  scripts/diagnose_height_admission.py
   scripts/record_path_goal_alignment.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

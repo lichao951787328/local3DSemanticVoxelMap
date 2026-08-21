@@ -7,12 +7,31 @@ publish_local_cost_cloud: false
 # Simulation robot body frame used by the local admission snapshot.
 global_admission_output_frame: base_link
 global_admission_exclude_dynamic: true
+# Publish the same filtered snapshot directly in SSMI's PointXYZRGBSemantic
+# schema. Source-specific simulation colors have already been normalized to
+# canonical labels before this common output encoding is applied.
+publish_ssmi_admitted_cloud: true
+ssmi_admitted_topic: /semantic_pcl/global_admitted
+ssmi_obstacle_traversability_threshold: 0.75
+# Recheck obstacle endpoints already accumulated by SSMI. Simulation depth
+# rays provide positive free-space evidence for old positions of movers that
+# were colored as static; absence from the rolling map alone never revokes.
+enable_ssmi_obstacle_revocation: true
+ssmi_revocation_voxel_size: 0.10
+ssmi_revocation_minimum_free_frames: 5
+ssmi_revocation_minimum_free_duration: 0.5
+ssmi_revocation_free_max_traversability: 0.45
+ssmi_revocation_minimum_semantic_confidence: 0.60
+ssmi_revocation_ray_evidence_enabled: true
+ssmi_revocation_ray_endpoint_margin: 0.20
+ssmi_revocation_ray_point_stride: 2
 # This source has no traversability field. On terrain labels 0/1/9, mark both
 # sides of a local height discontinuity as obstacles. The 0.20 m neighborhood
 # bridges the narrow invalid band created by the depth-edge filter.
 terrain_height_cost_enabled: true
-terrain_height_difference_threshold: 0.15
+terrain_height_difference_threshold: 0.18
 terrain_height_neighborhood_radius: 0.20
+terrain_height_comparison_epsilon: 0.000001
 terrain_height_obstacle_cost: 1.0
 input_layout: image
 point_stride: 1
@@ -32,8 +51,11 @@ pixel_offset_x: 2
 pixel_offset_y: 2
 timing_report_frames: 50  # report map-update avg/min/max every N input frames
 
-# Sparse local voxel map
-voxel_size: 0.10
+# Sparse local voxel map 保留的是球形的点
+# Keep 0.10 m planar cells while halving vertical quantization. A real 0.10 m
+# stair rise can then quantize to at most 0.15 m instead of 0.20 m.
+voxel_size_xy: 0.10
+voxel_size_z: 0.05
 decay_seconds: 0.5       # current depth stamp - voxel's last-hit depth stamp
 max_voxels: 500000
 max_range: 15.0          # <= 0 disables the input range limit
@@ -41,6 +63,14 @@ min_z: -2.0
 max_z: 4.0
 local_radius: 20.0       # <= 0 disables spatial pruning
 local_box_enabled: false
+# Remove self-observations from legs/body before any voxel or height processing.
+# The incoming simulation cloud is expressed in base_link. The larger rearward
+# x extent accounts for the cameras being mounted toward the robot front.
+robot_body_exclusion_enabled: true
+robot_body_exclusion_min_x: -0.5
+robot_body_exclusion_max_x: 0.5
+robot_body_exclusion_min_y: -0.3
+robot_body_exclusion_max_y: 0.3
 
 # The simulation palette is normalized to the same canonical IDs used by the
 # recorded /grids_points pipeline, so local admission has identical label rules.
@@ -65,7 +95,8 @@ cost_rise_alpha: 0.65
 cost_fall_alpha: 0.15
 
 # Classes below use canonical IDs after semantic_label_remap while preserving
-# the original simulation colors in voxel_cloud.rgb and RViz.
+# the original simulation colors in voxel_cloud.rgb and RViz. The direct SSMI
+# output uses its own unified canonical palette instead.
 semantic_classes:
   - {label: 0,  name: floor_or_background, color: [80, 180, 80],    cost: 0.05}
   - {label: 2,  name: structure,           color: [128, 128, 128],  cost: 0.95}
