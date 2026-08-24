@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(local3d_semantic_voxel_map)
 
-add_compile_options(-std=c++14 -Wall -Wextra -Wpedantic)
+add_compile_options(-std=c++17 -Wall -Wextra -Wpedantic)
 
 find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
