@@ -63,10 +63,10 @@ max_z: 4.0
 # spherical alternative and is ignored while local_box_enabled is true.
 local_radius: -1.0
 local_box_enabled: true
-local_box_min_x: -10.0
+local_box_min_x: -2.0
 local_box_max_x: 10.0
-local_box_min_y: -10.0
-local_box_max_y: 10.0
+local_box_min_y: -5.0
+local_box_max_y: 5.0
 local_box_min_z: -2.0
 local_box_max_z: 4.0
 # The recorded /grids_points pipeline is already preprocessed; keep the

@@ -45,6 +45,7 @@ add_library(semantic_voxel_map
   src/semantic_fusion.cpp
   src/semantic_voxel_map.cpp
   src/ssmi_semantic_encoding.cpp
+  src/terrain_boundary_filter.cpp
 )
 target_link_libraries(semantic_voxel_map ${catkin_LIBRARIES})
 add_dependencies(semantic_voxel_map ${catkin_EXPORTED_TARGETS})

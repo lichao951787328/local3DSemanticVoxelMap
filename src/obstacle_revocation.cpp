@@ -10,7 +10,10 @@ namespace local3d_semantic_voxel_map
 
 ObstacleRevocationTracker::ObstacleRevocationTracker(
   const ObstacleRevocationConfig& config)
-  : config_(config)
+  : config_(config),
+    terrain_labels_(config.terrain_labels.begin(), config.terrain_labels.end()),
+    obstacle_labels_(config.obstacle_labels.begin(), config.obstacle_labels.end()),
+    dynamic_labels_(config.dynamic_labels.begin(), config.dynamic_labels.end())
 {
   if (config_.voxel_size <= 0.0 || config_.minimum_free_frames == 0u ||
       config_.minimum_free_duration < 0.0 ||
@@ -20,9 +23,25 @@ ObstacleRevocationTracker::ObstacleRevocationTracker(
       config_.obstacle_min_traversability > 1.0f ||
       config_.minimum_semantic_confidence < 0.0f ||
       config_.minimum_semantic_confidence > 1.0f ||
-      config_.ray_endpoint_margin < 0.0)
+      config_.ray_endpoint_margin < 0.0 ||
+      config_.terrain_labels.empty() || config_.obstacle_labels.empty())
   {
     throw std::invalid_argument("invalid obstacle revocation configuration");
+  }
+  for (const std::uint32_t label : terrain_labels_)
+  {
+    if (obstacle_labels_.count(label) != 0u ||
+        dynamic_labels_.count(label) != 0u)
+    {
+      throw std::invalid_argument("obstacle revocation semantic roles overlap");
+    }
+  }
+  for (const std::uint32_t label : obstacle_labels_)
+  {
+    if (dynamic_labels_.count(label) != 0u)
+    {
+      throw std::invalid_argument("obstacle revocation semantic roles overlap");
+    }
   }
 }
 
@@ -86,14 +105,20 @@ void ObstacleRevocationTracker::collectTrackedRayEvidence(
   }
 }
 
-bool ObstacleRevocationTracker::isDynamic(const std::uint32_t label)
+bool ObstacleRevocationTracker::isDynamic(const std::uint32_t label) const
 {
-  return label >= 11u && label <= 18u;
+  return dynamic_labels_.count(label) != 0u;
 }
 
-bool ObstacleRevocationTracker::isTerrain(const std::uint32_t label)
+bool ObstacleRevocationTracker::isTerrain(const std::uint32_t label) const
 {
-  return label == 0u || label == 1u || label == 9u;
+  return terrain_labels_.count(label) != 0u;
+}
+
+bool ObstacleRevocationTracker::isSemanticObstacle(
+  const std::uint32_t label) const
+{
+  return obstacle_labels_.count(label) != 0u;
 }
 
 bool ObstacleRevocationTracker::isObstacle(const VoxelSnapshot& voxel) const
@@ -102,8 +127,7 @@ bool ObstacleRevocationTracker::isObstacle(const VoxelSnapshot& voxel) const
   {
     return false;
   }
-  const bool static_semantic = voxel.label >= 2u && voxel.label <= 8u;
-  return static_semantic ||
+  return isSemanticObstacle(voxel.label) ||
     (std::isfinite(voxel.traversability_cost) &&
      voxel.traversability_cost >= config_.obstacle_min_traversability);
 }
@@ -125,7 +149,8 @@ ObstacleRevocationPoint ObstacleRevocationTracker::makePoint(
 ObstacleRevocationResult ObstacleRevocationTracker::update(
   const std::vector<VoxelSnapshot>& current_voxels,
   const std::unordered_set<VoxelKey, VoxelKeyHash>& ray_free_evidence,
-  const ros::Time& stamp)
+  const ros::Time& stamp,
+  const std::unordered_set<VoxelKey, VoxelKeyHash>& reclassified_evidence)
 {
   ObstacleRevocationResult result;
   if (stamp.isZero())
@@ -177,6 +202,8 @@ ObstacleRevocationResult ObstacleRevocationTracker::update(
   }
 
   std::unordered_set<VoxelKey, VoxelKeyHash> evidence_keys = ray_free_evidence;
+  evidence_keys.insert(reclassified_evidence.begin(),
+                       reclassified_evidence.end());
   for (const auto& item : current)
   {
     if (item.second.free_terrain)
@@ -223,7 +250,14 @@ ObstacleRevocationResult ObstacleRevocationTracker::update(
     {
       const ObstacleRevocationPoint revoked =
         makePoint(key, tracked);
-      result.revoked_free.push_back(revoked);
+      if (reclassified_evidence.count(key) != 0u)
+      {
+        result.revoked_reclassified.push_back(revoked);
+      }
+      else
+      {
+        result.revoked_free.push_back(revoked);
+      }
       result.revoked_keys.insert(key);
       tracked_.erase(tracked_iterator);
     }

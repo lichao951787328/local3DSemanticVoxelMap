@@ -23,6 +23,13 @@ struct ObstacleRevocationConfig
   float obstacle_min_traversability = 0.75f;
   float minimum_semantic_confidence = 0.60f;
   double ray_endpoint_margin = 0.20;
+  // Defaults preserve the original Cityscapes contract. Dataset-specific
+  // pipelines may override these roles (for example obstacle 0 and terrain
+  // 1/2/3/4 in the five-class bag).
+  std::vector<std::uint32_t> terrain_labels{0u, 1u, 9u};
+  std::vector<std::uint32_t> obstacle_labels{2u, 3u, 4u, 5u, 6u, 7u, 8u};
+  std::vector<std::uint32_t> dynamic_labels{
+    11u, 12u, 13u, 14u, 15u, 16u, 17u, 18u};
 };
 
 struct ObstacleRevocationPoint
@@ -40,6 +47,7 @@ struct ObstacleRevocationResult
 {
   std::vector<ObstacleRevocationPoint> candidates;
   std::vector<ObstacleRevocationPoint> revoked_free;
+  std::vector<ObstacleRevocationPoint> revoked_reclassified;
   std::unordered_set<VoxelKey, VoxelKeyHash> revoked_keys;
 };
 
@@ -67,7 +75,10 @@ public:
   ObstacleRevocationResult update(
     const std::vector<VoxelSnapshot>& current_voxels,
     const std::unordered_set<VoxelKey, VoxelKeyHash>& ray_free_evidence,
-    const ros::Time& stamp);
+    const ros::Time& stamp,
+    const std::unordered_set<VoxelKey, VoxelKeyHash>&
+      reclassified_evidence =
+        std::unordered_set<VoxelKey, VoxelKeyHash>());
 
   void clear();
 
@@ -85,13 +96,17 @@ private:
     std::size_t last_free_frame_sequence = 0u;
   };
 
-  static bool isDynamic(std::uint32_t label);
-  static bool isTerrain(std::uint32_t label);
+  bool isDynamic(std::uint32_t label) const;
+  bool isTerrain(std::uint32_t label) const;
+  bool isSemanticObstacle(std::uint32_t label) const;
   bool isObstacle(const VoxelSnapshot& voxel) const;
   ObstacleRevocationPoint makePoint(
     const VoxelKey& key, const TrackedObstacle& obstacle) const;
 
   ObstacleRevocationConfig config_;
+  std::unordered_set<std::uint32_t> terrain_labels_;
+  std::unordered_set<std::uint32_t> obstacle_labels_;
+  std::unordered_set<std::uint32_t> dynamic_labels_;
   std::unordered_map<VoxelKey, TrackedObstacle, VoxelKeyHash> tracked_;
   ros::Time latest_stamp_;
   std::size_t frame_sequence_ = 0u;

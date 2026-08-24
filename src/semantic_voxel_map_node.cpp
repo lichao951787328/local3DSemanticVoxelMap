@@ -2,6 +2,7 @@
 #include "local3d_semantic_voxel_map/global_semantic_admission.hpp"
 #include "local3d_semantic_voxel_map/obstacle_revocation.hpp"
 #include "local3d_semantic_voxel_map/ssmi_semantic_encoding.hpp"
+#include "local3d_semantic_voxel_map/terrain_boundary_filter.hpp"
 
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/TransformStamped.h>
@@ -171,6 +172,33 @@ double xmlNumber(const XmlRpc::XmlRpcValue& value)
   throw std::runtime_error("expected a numeric parameter");
 }
 
+std::vector<std::uint32_t> loadLabelList(
+  const ros::NodeHandle& node, const std::string& name,
+  const std::vector<std::uint32_t>& defaults)
+{
+  XmlRpc::XmlRpcValue values;
+  if (!node.getParam(name, values))
+  {
+    return defaults;
+  }
+  if (values.getType() != XmlRpc::XmlRpcValue::TypeArray)
+  {
+    throw std::runtime_error("~" + name + " must be a YAML list");
+  }
+  std::vector<std::uint32_t> labels;
+  labels.reserve(values.size());
+  for (int index = 0; index < values.size(); ++index)
+  {
+    if (values[index].getType() == XmlRpc::XmlRpcValue::TypeInt &&
+        static_cast<int>(values[index]) < 0)
+    {
+      throw std::runtime_error("~" + name + " labels must be non-negative");
+    }
+    labels.push_back(parseLabel(values[index]));
+  }
+  return labels;
+}
+
 }  // namespace
 
 class SemanticVoxelMapNode
@@ -231,6 +259,8 @@ public:
                                    "/semantic_pcl/semantic_pcl");
     private_nh_.param<std::string>("global_frame", global_frame_, "map");
     private_nh_.param("use_initial_pose_reference", use_initial_pose_reference_, false);
+    private_nh_.param("initial_pose_reference_yaw_only",
+                      initial_pose_reference_yaw_only_, false);
     private_nh_.param<std::string>("reference_frame", reference_frame_, "map_start");
     private_nh_.param<std::string>("semantic_field", semantic_field_,
                                    "semantic_color");
@@ -273,6 +303,15 @@ public:
                       revocation_config.minimum_semantic_confidence, 0.60f);
     private_nh_.param("ssmi_revocation_ray_endpoint_margin",
                       revocation_config.ray_endpoint_margin, 0.20);
+    revocation_config.terrain_labels = loadLabelList(
+      private_nh_, "ssmi_revocation_terrain_labels",
+      revocation_config.terrain_labels);
+    revocation_config.obstacle_labels = loadLabelList(
+      private_nh_, "ssmi_revocation_obstacle_labels",
+      revocation_config.obstacle_labels);
+    revocation_config.dynamic_labels = loadLabelList(
+      private_nh_, "ssmi_revocation_dynamic_labels",
+      revocation_config.dynamic_labels);
     private_nh_.param("ssmi_revocation_ray_evidence_enabled",
                       ssmi_revocation_ray_evidence_enabled_, false);
     private_nh_.param("ssmi_revocation_ray_point_stride",
@@ -287,6 +326,65 @@ public:
       obstacle_revocation_tracker_.reset(
         new ObstacleRevocationTracker(revocation_config));
     }
+    TerrainBoundaryFilterConfig boundary_filter_config;
+    private_nh_.param("terrain_boundary_filter_enabled",
+                      boundary_filter_config.enabled, false);
+    int boundary_obstacle_label = static_cast<int>(
+      boundary_filter_config.obstacle_label);
+    private_nh_.param("terrain_boundary_obstacle_label",
+                      boundary_obstacle_label, boundary_obstacle_label);
+    if (boundary_obstacle_label < 0)
+    {
+      throw std::runtime_error(
+        "~terrain_boundary_obstacle_label must be non-negative");
+    }
+    boundary_filter_config.obstacle_label =
+      static_cast<std::uint32_t>(boundary_obstacle_label);
+    boundary_filter_config.terrain_labels = loadLabelList(
+      private_nh_, "terrain_boundary_terrain_labels",
+      boundary_filter_config.terrain_labels);
+    int boundary_opening_radius = static_cast<int>(
+      boundary_filter_config.opening_radius_cells);
+    private_nh_.param("terrain_boundary_opening_radius_cells",
+                      boundary_opening_radius, boundary_opening_radius);
+    if (boundary_opening_radius < 0)
+    {
+      throw std::runtime_error(
+        "~terrain_boundary_opening_radius_cells must be non-negative");
+    }
+    boundary_filter_config.opening_radius_cells =
+      static_cast<std::size_t>(boundary_opening_radius);
+    private_nh_.param("terrain_boundary_neighborhood_radius",
+                      boundary_filter_config.neighborhood_radius, 0.30);
+    private_nh_.param("terrain_boundary_vertical_tolerance",
+                      boundary_filter_config.vertical_tolerance, 0.15);
+    int boundary_minimum_neighbors = static_cast<int>(
+      boundary_filter_config.minimum_terrain_neighbors);
+    private_nh_.param("terrain_boundary_minimum_terrain_neighbors",
+                      boundary_minimum_neighbors, boundary_minimum_neighbors);
+    if (boundary_minimum_neighbors <= 0)
+    {
+      throw std::runtime_error(
+        "~terrain_boundary_minimum_terrain_neighbors must be positive");
+    }
+    boundary_filter_config.minimum_terrain_neighbors =
+      static_cast<std::size_t>(boundary_minimum_neighbors);
+    int boundary_minimum_labels = static_cast<int>(
+      boundary_filter_config.minimum_distinct_terrain_labels);
+    private_nh_.param("terrain_boundary_minimum_distinct_terrain_labels",
+                      boundary_minimum_labels, boundary_minimum_labels);
+    if (boundary_minimum_labels <= 0)
+    {
+      throw std::runtime_error(
+        "~terrain_boundary_minimum_distinct_terrain_labels must be positive");
+    }
+    boundary_filter_config.minimum_distinct_terrain_labels =
+      static_cast<std::size_t>(boundary_minimum_labels);
+    private_nh_.param("terrain_boundary_minimum_terrain_ratio",
+                      boundary_filter_config.minimum_terrain_ratio, 0.70);
+    terrain_boundary_filter_.reset(
+      new TerrainBoundaryFilter(boundary_filter_config));
+    terrain_boundary_filter_config_ = boundary_filter_config;
     private_nh_.param("terrain_height_cost_enabled",
                       terrain_height_cost_config_.enabled, false);
     private_nh_.param("terrain_height_difference_threshold",
@@ -486,6 +584,17 @@ public:
              enable_ssmi_obstacle_revocation_ ? "enabled" : "disabled",
              ssmi_revocation_ray_evidence_enabled_ ? "enabled" : "disabled",
              ssmi_revocation_ray_point_stride_);
+    ROS_INFO("Terrain-boundary obstacle cleanup: %s, obstacle=%u, "
+             "terrain_classes=%zu, opening=%zu cell(s), neighborhood=%.2f m, "
+             "vertical=%.2f m, terrain_ratio>=%.2f, distinct_classes>=%zu",
+             terrain_boundary_filter_config_.enabled ? "enabled" : "disabled",
+             terrain_boundary_filter_config_.obstacle_label,
+             terrain_boundary_filter_config_.terrain_labels.size(),
+             terrain_boundary_filter_config_.opening_radius_cells,
+             terrain_boundary_filter_config_.neighborhood_radius,
+             terrain_boundary_filter_config_.vertical_tolerance,
+             terrain_boundary_filter_config_.minimum_terrain_ratio,
+             terrain_boundary_filter_config_.minimum_distinct_terrain_labels);
     ROS_INFO("Missing-cost terrain height inference: %s, dz>%.2f m + %.1e "
              "within %.2f m -> cost %.2f (terrain labels 0/1/9 only)",
              terrain_height_cost_config_.enabled ? "enabled" : "disabled",
@@ -719,7 +828,16 @@ private:
     const tf2::Transform sensor_to_global(rotation, translation);
     if (use_initial_pose_reference_ && !have_initial_reference_)
     {
-      initial_reference_to_global_ = sensor_to_global;
+      const double yaw = std::atan2(
+        2.0 * (rotation.w() * rotation.z() + rotation.x() * rotation.y()),
+        1.0 - 2.0 * (rotation.y() * rotation.y() + rotation.z() * rotation.z()));
+      tf2::Quaternion reference_rotation = rotation;
+      if (initial_pose_reference_yaw_only_)
+      {
+        reference_rotation.setRPY(0.0, 0.0, yaw);
+        reference_rotation.normalize();
+      }
+      initial_reference_to_global_ = tf2::Transform(reference_rotation, translation);
       have_initial_reference_ = true;
       initial_reference_stamp_ = message->header.stamp;
 
@@ -727,18 +845,23 @@ private:
       reference_transform.header.stamp = initial_reference_stamp_;
       reference_transform.header.frame_id = global_frame_;
       reference_transform.child_frame_id = reference_frame_;
-      reference_transform.transform = transform.transform;
+      reference_transform.transform.translation.x = translation.x();
+      reference_transform.transform.translation.y = translation.y();
+      reference_transform.transform.translation.z = translation.z();
+      reference_transform.transform.rotation.x = reference_rotation.x();
+      reference_transform.transform.rotation.y = reference_rotation.y();
+      reference_transform.transform.rotation.z = reference_rotation.z();
+      reference_transform.transform.rotation.w = reference_rotation.w();
       reference_tf_broadcaster_.sendTransform(reference_transform);
 
-      const double yaw = std::atan2(
-        2.0 * (rotation.w() * rotation.z() + rotation.x() * rotation.y()),
-        1.0 - 2.0 * (rotation.y() * rotation.y() + rotation.z() * rotation.z()));
       ROS_INFO("Captured initial cloud pose at %.9f: %s <- %s, "
-               "xyz=(%.6f, %.6f, %.6f), yaw=%.3f deg; map origin is now '%s'",
+               "xyz=(%.6f, %.6f, %.6f), yaw=%.3f deg; map origin is now '%s' "
+               "with %s rotation",
                initial_reference_stamp_.toSec(), global_frame_.c_str(),
                message->header.frame_id.c_str(), translation.x(), translation.y(),
                translation.z(), yaw * 180.0 / 3.14159265358979323846,
-               reference_frame_.c_str());
+               reference_frame_.c_str(),
+               initial_pose_reference_yaw_only_ ? "yaw-only" : "full 3D");
     }
 
     const tf2::Transform sensor_to_map = use_initial_pose_reference_ ?
@@ -975,30 +1098,74 @@ private:
       latest_sensor_qw_ = sensor_rotation.w();
       have_sensor_origin_ = true;
     }
+    // Materialize and commit one complete PointCloud2 after the frame update.
+    // The timer only republishes this cached message.
+    pending_ray_free_evidence_ = std::move(ray_free_evidence);
+
+    const ros::WallTime postprocess_start = ros::WallTime::now();
+    publish(message->header.stamp, true);
+    const double postprocess_publish_ms =
+      (ros::WallTime::now() - postprocess_start).toSec() * 1000.0;
+    const double callback_total_ms =
+      (ros::WallTime::now() - callback_start).toSec() * 1000.0;
+    const double source_to_publish_ms =
+      (ros::Time::now() - message->header.stamp).toSec() * 1000.0;
+
     ++timing_frame_count_;
     timing_elapsed_sum_ms_ += elapsed_ms;
     timing_elapsed_min_ms_ = std::min(timing_elapsed_min_ms_, elapsed_ms);
     timing_elapsed_max_ms_ = std::max(timing_elapsed_max_ms_, elapsed_ms);
+    timing_postprocess_sum_ms_ += postprocess_publish_ms;
+    timing_postprocess_min_ms_ =
+      std::min(timing_postprocess_min_ms_, postprocess_publish_ms);
+    timing_postprocess_max_ms_ =
+      std::max(timing_postprocess_max_ms_, postprocess_publish_ms);
+    timing_callback_total_sum_ms_ += callback_total_ms;
+    timing_callback_total_min_ms_ =
+      std::min(timing_callback_total_min_ms_, callback_total_ms);
+    timing_callback_total_max_ms_ =
+      std::max(timing_callback_total_max_ms_, callback_total_ms);
+    timing_source_to_publish_sum_ms_ += source_to_publish_ms;
+    timing_source_to_publish_min_ms_ =
+      std::min(timing_source_to_publish_min_ms_, source_to_publish_ms);
+    timing_source_to_publish_max_ms_ =
+      std::max(timing_source_to_publish_max_ms_, source_to_publish_ms);
     if (timing_report_frames_ > 0 &&
         timing_frame_count_ >= static_cast<std::size_t>(timing_report_frames_))
     {
       ROS_INFO(
-        "Map update timing over %zu depth frames: avg=%.2f ms, min=%.2f ms, "
-        "max=%.2f ms; latest sampled=%zu/%zu, valid=%zu, scan_voxels=%zu, "
+        "Pipeline timing over %zu input frames: "
+        "map_update avg/min/max=%.2f/%.2f/%.2f ms; "
+        "postprocess_publish avg/min/max=%.2f/%.2f/%.2f ms; "
+        "callback_total avg/min/max=%.2f/%.2f/%.2f ms; "
+        "source_to_publish avg/min/max=%.2f/%.2f/%.2f ms; "
+        "latest sampled=%zu/%zu, valid=%zu, scan_voxels=%zu, "
         "body_rejected=%zu, expired=%zu, map_voxels=%zu",
         timing_frame_count_, timing_elapsed_sum_ms_ / timing_frame_count_,
-        timing_elapsed_min_ms_, timing_elapsed_max_ms_, sampled_points,
-        point_count, valid_points, scan_voxels.size(),
+        timing_elapsed_min_ms_, timing_elapsed_max_ms_,
+        timing_postprocess_sum_ms_ / timing_frame_count_,
+        timing_postprocess_min_ms_, timing_postprocess_max_ms_,
+        timing_callback_total_sum_ms_ / timing_frame_count_,
+        timing_callback_total_min_ms_, timing_callback_total_max_ms_,
+        timing_source_to_publish_sum_ms_ / timing_frame_count_,
+        timing_source_to_publish_min_ms_, timing_source_to_publish_max_ms_,
+        sampled_points, point_count, valid_points, scan_voxels.size(),
         robot_body_rejected_points, temporally_removed, map_->size());
       timing_frame_count_ = 0u;
       timing_elapsed_sum_ms_ = 0.0;
       timing_elapsed_min_ms_ = std::numeric_limits<double>::max();
       timing_elapsed_max_ms_ = 0.0;
+      timing_postprocess_sum_ms_ = 0.0;
+      timing_postprocess_min_ms_ = std::numeric_limits<double>::max();
+      timing_postprocess_max_ms_ = 0.0;
+      timing_callback_total_sum_ms_ = 0.0;
+      timing_callback_total_min_ms_ = std::numeric_limits<double>::max();
+      timing_callback_total_max_ms_ = 0.0;
+      timing_source_to_publish_sum_ms_ = 0.0;
+      timing_source_to_publish_min_ms_ = std::numeric_limits<double>::max();
+      timing_source_to_publish_max_ms_ =
+        -std::numeric_limits<double>::max();
     }
-    // Materialize and commit one complete PointCloud2 after the frame update.
-    // The timer only republishes this cached message.
-    pending_ray_free_evidence_ = std::move(ray_free_evidence);
-    publish(message->header.stamp, true);
   }
 
   void timerCallback(const ros::TimerEvent&)
@@ -1023,12 +1190,27 @@ private:
     const std::size_t derived_height_obstacles =
       applyTerrainHeightDiscontinuityCost(
         voxels, map_->voxelSizeXY(), terrain_height_cost_config_);
+    TerrainBoundaryFilterResult boundary_filter_result;
+    if (terrain_boundary_filter_)
+    {
+      boundary_filter_result = terrain_boundary_filter_->filter(
+        voxels, map_->voxelSizeXY(), map_->voxelSizeZ());
+      voxels = std::move(boundary_filter_result.voxels);
+    }
     const std::vector<TraversabilityColumnSnapshot> cost_columns =
       projectTraversabilityColumns(voxels);
     if (commit_voxel_snapshot && derived_height_obstacles > 0u)
     {
       ROS_DEBUG("Raised %zu missing-cost terrain voxels for height discontinuities",
                 derived_height_obstacles);
+    }
+    if (commit_voxel_snapshot && !boundary_filter_result.relabeled.empty())
+    {
+      ROS_INFO_THROTTLE(
+        2.0, "Terrain-boundary cleanup reclassified %zu thin label-%u voxels "
+        "using neighboring terrain classes",
+        boundary_filter_result.relabeled.size(),
+        terrain_boundary_filter_config_.obstacle_label);
     }
     visualization_msgs::Marker semantic_marker;
     semantic_marker.header.frame_id = mapFrame();
@@ -1147,7 +1329,8 @@ private:
     }
     cloud_pub_.publish(cloud);
     publishTraversabilityCostClouds(cost_columns, stamp);
-    publishAdmissionClouds(voxels, stamp, commit_voxel_snapshot);
+    publishAdmissionClouds(voxels, boundary_filter_result.relabeled, stamp,
+                           commit_voxel_snapshot);
   }
 
   sensor_msgs::PointCloud2 makeAdmissionCloud(
@@ -1242,8 +1425,10 @@ private:
     return cloud;
   }
 
-  void updateAdmissionSnapshot(const std::vector<VoxelSnapshot>& voxels,
-                               const ros::Time& stamp)
+  void updateAdmissionSnapshot(
+    const std::vector<VoxelSnapshot>& voxels,
+    const std::vector<TerrainBoundaryRelabel>& boundary_relabels,
+    const ros::Time& stamp)
   {
     AdmissionFrameResult result;
     const std::string output_frame = admission_output_frame_.empty() ?
@@ -1285,8 +1470,28 @@ private:
     ObstacleRevocationResult revocations;
     if (obstacle_revocation_tracker_)
     {
+      std::unordered_map<VoxelKey, const VoxelSnapshot*, VoxelKeyHash>
+        filtered_voxels;
+      filtered_voxels.reserve(voxels.size());
+      for (const VoxelSnapshot& voxel : voxels)
+      {
+        filtered_voxels[voxel.key] = &voxel;
+      }
+      std::unordered_set<VoxelKey, VoxelKeyHash> reclassified_evidence;
+      reclassified_evidence.reserve(boundary_relabels.size());
+      for (const TerrainBoundaryRelabel& relabel : boundary_relabels)
+      {
+        const auto voxel_iterator = filtered_voxels.find(relabel.key);
+        if (voxel_iterator == filtered_voxels.end())
+        {
+          continue;
+        }
+        const VoxelSnapshot& voxel = *voxel_iterator->second;
+        reclassified_evidence.insert(obstacle_revocation_tracker_->keyFor(
+          voxel.x, voxel.y, voxel.z));
+      }
       revocations = obstacle_revocation_tracker_->update(
-        voxels, pending_ray_free_evidence_, stamp);
+        voxels, pending_ray_free_evidence_, stamp, reclassified_evidence);
     }
     pending_ray_free_evidence_.clear();
 
@@ -1345,22 +1550,38 @@ private:
         revoked.x, revoked.y, revoked.z,
         revoked.traversability, revoked.label));
     }
+    result.revoked_reclassified.reserve(
+      revocations.revoked_reclassified.size());
+    for (const ObstacleRevocationPoint& revoked :
+         revocations.revoked_reclassified)
+    {
+      result.revoked_reclassified.push_back(transform_admission_point(
+        revoked.x, revoked.y, revoked.z,
+        revoked.traversability, revoked.label));
+    }
     if (!result.revoked_free.empty())
     {
       ROS_INFO("Confirmed %zu stale SSMI obstacle voxels as free at %.6f",
                result.revoked_free.size(), stamp.toSec());
     }
+    if (!result.revoked_reclassified.empty())
+    {
+      ROS_INFO("Confirmed %zu stale SSMI obstacle voxels as terrain-boundary "
+               "reclassifications at %.6f",
+               result.revoked_reclassified.size(), stamp.toSec());
+    }
     latest_admission_result_ = std::move(result);
     latest_admission_frame_ = output_frame;
   }
 
-  void publishAdmissionClouds(const std::vector<VoxelSnapshot>& voxels,
-                              const ros::Time& stamp,
-                              const bool commit_voxel_snapshot)
+  void publishAdmissionClouds(
+    const std::vector<VoxelSnapshot>& voxels,
+    const std::vector<TerrainBoundaryRelabel>& boundary_relabels,
+    const ros::Time& stamp, const bool commit_voxel_snapshot)
   {
     if (commit_voxel_snapshot)
     {
-      updateAdmissionSnapshot(voxels, stamp);
+      updateAdmissionSnapshot(voxels, boundary_relabels, stamp);
     }
     const std::string& frame_id = latest_admission_frame_.empty() ?
       mapFrame() : latest_admission_frame_;
@@ -1562,6 +1783,7 @@ private:
   tf2_ros::StaticTransformBroadcaster reference_tf_broadcaster_;
   std::unique_ptr<SemanticVoxelMap> map_;
   std::unique_ptr<ObstacleRevocationTracker> obstacle_revocation_tracker_;
+  std::unique_ptr<TerrainBoundaryFilter> terrain_boundary_filter_;
   ros::Subscriber cloud_sub_;
   ros::Publisher semantic_marker_pub_;
   ros::Publisher cost_marker_pub_;
@@ -1598,12 +1820,14 @@ private:
   std::unordered_map<std::uint32_t, std::uint32_t> semantic_label_remap_;
   bool publish_local_cost_cloud_ = false;
   bool use_initial_pose_reference_ = false;
+  bool initial_pose_reference_yaw_only_ = false;
   bool admission_exclude_dynamic_ = true;
   bool publish_ssmi_admitted_cloud_ = true;
   bool enable_ssmi_obstacle_revocation_ = true;
   bool ssmi_revocation_ray_evidence_enabled_ = false;
   int ssmi_revocation_ray_point_stride_ = 2;
   TerrainHeightCostConfig terrain_height_cost_config_;
+  TerrainBoundaryFilterConfig terrain_boundary_filter_config_;
   float default_confidence_ = 1.0f;
   float ssmi_obstacle_traversability_threshold_ = 0.75f;
   double max_range_ = 15.0;
@@ -1646,6 +1870,16 @@ private:
   double timing_elapsed_sum_ms_ = 0.0;
   double timing_elapsed_min_ms_ = std::numeric_limits<double>::max();
   double timing_elapsed_max_ms_ = 0.0;
+  double timing_postprocess_sum_ms_ = 0.0;
+  double timing_postprocess_min_ms_ = std::numeric_limits<double>::max();
+  double timing_postprocess_max_ms_ = 0.0;
+  double timing_callback_total_sum_ms_ = 0.0;
+  double timing_callback_total_min_ms_ = std::numeric_limits<double>::max();
+  double timing_callback_total_max_ms_ = 0.0;
+  double timing_source_to_publish_sum_ms_ = 0.0;
+  double timing_source_to_publish_min_ms_ = std::numeric_limits<double>::max();
+  double timing_source_to_publish_max_ms_ =
+    -std::numeric_limits<double>::max();
 
   std::mutex sensor_origin_mutex_;
   bool have_sensor_origin_ = false;
