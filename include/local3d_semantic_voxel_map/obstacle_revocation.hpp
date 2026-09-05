@@ -19,6 +19,12 @@ struct ObstacleRevocationConfig
   double voxel_size = 0.10;
   std::size_t minimum_free_frames = 5u;
   double minimum_free_duration = 0.5;
+  // Qualifying free observations need not be consecutive. Each observation
+  // adds confidence-weighted evidence and missing observations decay it. A
+  // strong obstacle observation resets it immediately.
+  // Zero inherits minimum_free_frames for backward-compatible callers.
+  double minimum_free_evidence = 0.0;
+  double free_evidence_decay_per_second = 0.0;
   float free_max_traversability = 0.45f;
   float obstacle_min_traversability = 0.75f;
   float minimum_semantic_confidence = 0.60f;
@@ -28,6 +34,11 @@ struct ObstacleRevocationConfig
   // 1/2/3/4 in the five-class bag).
   std::vector<std::uint32_t> terrain_labels{0u, 1u, 9u};
   std::vector<std::uint32_t> obstacle_labels{2u, 3u, 4u, 5u, 6u, 7u, 8u};
+  // Ambiguous labels remain local safety obstacles, but a low measured cost
+  // does not erase accumulated free evidence merely because semantic output
+  // flickered back to the ambiguous label.
+  std::vector<std::uint32_t> ambiguous_obstacle_labels;
+  float ambiguous_obstacle_reset_min_traversability = 0.65f;
   std::vector<std::uint32_t> dynamic_labels{
     11u, 12u, 13u, 14u, 15u, 16u, 17u, 18u};
 };
@@ -41,6 +52,7 @@ struct ObstacleRevocationPoint
   std::uint32_t label = kInvalidSemanticLabel;
   float traversability = 1.0f;
   std::size_t evidence_frames = 0u;
+  double evidence_score = 0.0;
 };
 
 struct ObstacleRevocationResult
@@ -93,23 +105,26 @@ private:
     ros::Time first_free_stamp;
     ros::Time last_free_stamp;
     std::size_t free_frames = 0u;
-    std::size_t last_free_frame_sequence = 0u;
+    double free_evidence = 0.0;
+    ros::Time last_evidence_update_stamp;
   };
 
   bool isDynamic(std::uint32_t label) const;
   bool isTerrain(std::uint32_t label) const;
   bool isSemanticObstacle(std::uint32_t label) const;
+  bool isAmbiguousObstacle(std::uint32_t label) const;
   bool isObstacle(const VoxelSnapshot& voxel) const;
+  bool isStrongObstacleContradiction(const VoxelSnapshot& voxel) const;
   ObstacleRevocationPoint makePoint(
     const VoxelKey& key, const TrackedObstacle& obstacle) const;
 
   ObstacleRevocationConfig config_;
   std::unordered_set<std::uint32_t> terrain_labels_;
   std::unordered_set<std::uint32_t> obstacle_labels_;
+  std::unordered_set<std::uint32_t> ambiguous_obstacle_labels_;
   std::unordered_set<std::uint32_t> dynamic_labels_;
   std::unordered_map<VoxelKey, TrackedObstacle, VoxelKeyHash> tracked_;
   ros::Time latest_stamp_;
-  std::size_t frame_sequence_ = 0u;
 };
 
 }  // namespace local3d_semantic_voxel_map

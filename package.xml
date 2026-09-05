@@ -10,6 +10,7 @@
   <buildtool_depend>catkin</buildtool_depend>
 
   <depend>geometry_msgs</depend>
+  <depend>libopencv-dev</depend>
   <depend>nav_msgs</depend>
   <depend>roscpp</depend>
   <depend>rospy</depend>

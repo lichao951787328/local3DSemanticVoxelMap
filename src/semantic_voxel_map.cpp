@@ -388,9 +388,10 @@ std::size_t applyTerrainHeightDiscontinuityCost(
     return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32u) |
            static_cast<std::uint32_t>(y);
   };
-  const auto is_terrain = [](const std::uint32_t label)
+  const auto is_terrain = [&config](const std::uint32_t label)
   {
-    return label == 0u || label == 1u || label == 9u;
+    return std::find(config.terrain_labels.begin(), config.terrain_labels.end(),
+                     label) != config.terrain_labels.end();
   };
 
   std::unordered_map<std::uint64_t, TerrainColumn> columns;

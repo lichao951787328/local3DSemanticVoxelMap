@@ -13,14 +13,25 @@ ObstacleRevocationTracker::ObstacleRevocationTracker(
   : config_(config),
     terrain_labels_(config.terrain_labels.begin(), config.terrain_labels.end()),
     obstacle_labels_(config.obstacle_labels.begin(), config.obstacle_labels.end()),
+    ambiguous_obstacle_labels_(config.ambiguous_obstacle_labels.begin(),
+                               config.ambiguous_obstacle_labels.end()),
     dynamic_labels_(config.dynamic_labels.begin(), config.dynamic_labels.end())
 {
+  if (config_.minimum_free_evidence == 0.0)
+  {
+    config_.minimum_free_evidence =
+      static_cast<double>(config_.minimum_free_frames);
+  }
   if (config_.voxel_size <= 0.0 || config_.minimum_free_frames == 0u ||
       config_.minimum_free_duration < 0.0 ||
+      config_.minimum_free_evidence < 0.0 ||
+      config_.free_evidence_decay_per_second < 0.0 ||
       config_.free_max_traversability < 0.0f ||
       config_.free_max_traversability > 1.0f ||
       config_.obstacle_min_traversability < 0.0f ||
       config_.obstacle_min_traversability > 1.0f ||
+      config_.ambiguous_obstacle_reset_min_traversability < 0.0f ||
+      config_.ambiguous_obstacle_reset_min_traversability > 1.0f ||
       config_.minimum_semantic_confidence < 0.0f ||
       config_.minimum_semantic_confidence > 1.0f ||
       config_.ray_endpoint_margin < 0.0 ||
@@ -121,6 +132,12 @@ bool ObstacleRevocationTracker::isSemanticObstacle(
   return obstacle_labels_.count(label) != 0u;
 }
 
+bool ObstacleRevocationTracker::isAmbiguousObstacle(
+  const std::uint32_t label) const
+{
+  return ambiguous_obstacle_labels_.count(label) != 0u;
+}
+
 bool ObstacleRevocationTracker::isObstacle(const VoxelSnapshot& voxel) const
 {
   if (isDynamic(voxel.label))
@@ -130,6 +147,30 @@ bool ObstacleRevocationTracker::isObstacle(const VoxelSnapshot& voxel) const
   return isSemanticObstacle(voxel.label) ||
     (std::isfinite(voxel.traversability_cost) &&
      voxel.traversability_cost >= config_.obstacle_min_traversability);
+}
+
+bool ObstacleRevocationTracker::isStrongObstacleContradiction(
+  const VoxelSnapshot& voxel) const
+{
+  if (isDynamic(voxel.label))
+  {
+    return true;
+  }
+  if (!isObstacle(voxel))
+  {
+    return false;
+  }
+  if (!isAmbiguousObstacle(voxel.label))
+  {
+    return true;
+  }
+  // Missing or invalid measured geometry stays conservative. A low measured
+  // cost on an ambiguous semantic label is neutral: it neither adds free
+  // evidence nor destroys evidence obtained from a stronger geometric test.
+  return !voxel.has_measured_traversability ||
+    !std::isfinite(voxel.measured_traversability_cost) ||
+    voxel.measured_traversability_cost >=
+      config_.ambiguous_obstacle_reset_min_traversability;
 }
 
 ObstacleRevocationPoint ObstacleRevocationTracker::makePoint(
@@ -143,6 +184,7 @@ ObstacleRevocationPoint ObstacleRevocationTracker::makePoint(
   point.label = obstacle.label;
   point.traversability = obstacle.traversability;
   point.evidence_frames = obstacle.free_frames;
+  point.evidence_score = obstacle.free_evidence;
   return point;
 }
 
@@ -162,13 +204,12 @@ ObstacleRevocationResult ObstacleRevocationTracker::update(
     return result;
   }
   latest_stamp_ = stamp;
-  ++frame_sequence_;
-
   struct CurrentState
   {
     bool obstacle = false;
-    bool dynamic = false;
+    bool strong_obstacle = false;
     bool free_terrain = false;
+    double free_evidence_weight = 0.0;
     const VoxelSnapshot* obstacle_voxel = nullptr;
   };
   std::unordered_map<VoxelKey, CurrentState, VoxelKeyHash> current;
@@ -177,10 +218,6 @@ ObstacleRevocationResult ObstacleRevocationTracker::update(
   {
     const VoxelKey key = keyFor(voxel.x, voxel.y, voxel.z);
     CurrentState& state = current[key];
-    if (isDynamic(voxel.label))
-    {
-      state.dynamic = true;
-    }
     if (isObstacle(voxel))
     {
       state.obstacle = true;
@@ -191,6 +228,10 @@ ObstacleRevocationResult ObstacleRevocationTracker::update(
         state.obstacle_voxel = &voxel;
       }
     }
+    if (isStrongObstacleContradiction(voxel))
+    {
+      state.strong_obstacle = true;
+    }
     if (isTerrain(voxel.label) &&
         voxel.last_observed == stamp &&
         voxel.semantic_confidence >= config_.minimum_semantic_confidence &&
@@ -198,22 +239,79 @@ ObstacleRevocationResult ObstacleRevocationTracker::update(
         voxel.traversability_cost <= config_.free_max_traversability)
     {
       state.free_terrain = true;
+      state.free_evidence_weight = std::max(
+        state.free_evidence_weight,
+        static_cast<double>(std::max(0.0f,
+          std::min(1.0f, voxel.semantic_confidence))));
     }
   }
 
-  std::unordered_set<VoxelKey, VoxelKeyHash> evidence_keys = ray_free_evidence;
-  evidence_keys.insert(reclassified_evidence.begin(),
-                       reclassified_evidence.end());
+  const auto reset_free_evidence = [](TrackedObstacle& tracked)
+  {
+    tracked.first_free_stamp = ros::Time();
+    tracked.last_free_stamp = ros::Time();
+    tracked.free_frames = 0u;
+    tracked.free_evidence = 0.0;
+  };
+
+  // Decay accumulated evidence in acquisition time. Missing or semantically
+  // flickering observations do not reset it abruptly.
+  for (auto& item : tracked_)
+  {
+    TrackedObstacle& tracked = item.second;
+    if (!tracked.last_evidence_update_stamp.isZero())
+    {
+      const double elapsed =
+        (stamp - tracked.last_evidence_update_stamp).toSec();
+      tracked.free_evidence = std::max(
+        0.0, tracked.free_evidence -
+          config_.free_evidence_decay_per_second * std::max(0.0, elapsed));
+      if (tracked.free_evidence <= 1e-9)
+      {
+        reset_free_evidence(tracked);
+      }
+    }
+    tracked.last_evidence_update_stamp = stamp;
+  }
+
+  // Only a positive obstacle/dynamic observation resets free evidence. A
+  // low-cost ambiguous label is deliberately neutral.
+  for (const auto& item : current)
+  {
+    if (!item.second.strong_obstacle)
+    {
+      continue;
+    }
+    const auto tracked = tracked_.find(item.first);
+    if (tracked != tracked_.end())
+    {
+      reset_free_evidence(tracked->second);
+    }
+  }
+
+  std::unordered_map<VoxelKey, double, VoxelKeyHash> evidence_weights;
+  evidence_weights.reserve(ray_free_evidence.size() +
+                           reclassified_evidence.size() + current.size());
+  for (const VoxelKey& key : ray_free_evidence)
+  {
+    evidence_weights[key] = 1.0;
+  }
+  for (const VoxelKey& key : reclassified_evidence)
+  {
+    evidence_weights[key] = 1.0;
+  }
   for (const auto& item : current)
   {
     if (item.second.free_terrain)
     {
-      evidence_keys.insert(item.first);
+      evidence_weights[item.first] = std::max(
+        evidence_weights[item.first], item.second.free_evidence_weight);
     }
   }
 
-  for (const VoxelKey& key : evidence_keys)
+  for (const auto& evidence : evidence_weights)
   {
+    const VoxelKey& key = evidence.first;
     auto tracked_iterator = tracked_.find(key);
     if (tracked_iterator == tracked_.end())
     {
@@ -221,31 +319,26 @@ ObstacleRevocationResult ObstacleRevocationTracker::update(
     }
     const auto current_iterator = current.find(key);
     if (current_iterator != current.end() &&
-        (current_iterator->second.obstacle || current_iterator->second.dynamic))
+        current_iterator->second.strong_obstacle)
     {
-      tracked_iterator->second.first_free_stamp = ros::Time();
-      tracked_iterator->second.last_free_stamp = ros::Time();
-      tracked_iterator->second.free_frames = 0u;
-      tracked_iterator->second.last_free_frame_sequence = 0u;
       continue;
     }
 
     TrackedObstacle& tracked = tracked_iterator->second;
-    const bool consecutive = tracked.free_frames != 0u &&
-      tracked.last_free_frame_sequence + 1u == frame_sequence_;
-    if (!consecutive)
+    if (tracked.free_evidence <= 1e-9)
     {
       tracked.first_free_stamp = stamp;
       tracked.free_frames = 0u;
     }
     tracked.last_free_stamp = stamp;
-    tracked.last_free_frame_sequence = frame_sequence_;
     ++tracked.free_frames;
+    tracked.free_evidence += std::max(0.0, std::min(1.0, evidence.second));
     result.candidates.push_back(makePoint(key, tracked));
 
     const double duration =
       (stamp - tracked.first_free_stamp).toSec();
     if (tracked.free_frames >= config_.minimum_free_frames &&
+        tracked.free_evidence >= config_.minimum_free_evidence &&
         duration >= config_.minimum_free_duration)
     {
       const ObstacleRevocationPoint revoked =
@@ -279,10 +372,14 @@ ObstacleRevocationResult ObstacleRevocationTracker::update(
     tracked.z = voxel.z;
     tracked.label = voxel.label;
     tracked.traversability = voxel.traversability_cost;
-    tracked.first_free_stamp = ros::Time();
-    tracked.last_free_stamp = ros::Time();
-    tracked.free_frames = 0u;
-    tracked.last_free_frame_sequence = 0u;
+    if (item.second.strong_obstacle)
+    {
+      reset_free_evidence(tracked);
+    }
+    if (tracked.last_evidence_update_stamp.isZero())
+    {
+      tracked.last_evidence_update_stamp = stamp;
+    }
   }
 
   return result;
@@ -292,7 +389,6 @@ void ObstacleRevocationTracker::clear()
 {
   tracked_.clear();
   latest_stamp_ = ros::Time();
-  frame_sequence_ = 0u;
 }
 
 }  // namespace local3d_semantic_voxel_map

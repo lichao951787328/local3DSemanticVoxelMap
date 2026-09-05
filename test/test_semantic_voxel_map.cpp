@@ -192,6 +192,100 @@ TEST(ObstacleRevocation, CachedTerrainIsNotRepeatedFreeEvidence)
   EXPECT_EQ(1u, tracker.trackedCount());
 }
 
+TEST(ObstacleRevocation, NonConsecutiveFreeEvidenceSurvivesLowCostAmbiguousLabel)
+{
+  map::ObstacleRevocationConfig config;
+  config.minimum_free_frames = 2u;
+  config.minimum_free_evidence = 2.0;
+  config.minimum_free_duration = 0.2;
+  config.free_evidence_decay_per_second = 0.0;
+  config.obstacle_labels = {0u, 2u};
+  config.terrain_labels = {1u};
+  config.ambiguous_obstacle_labels = {0u};
+  config.ambiguous_obstacle_reset_min_traversability = 0.65f;
+  map::ObstacleRevocationTracker tracker(config);
+  const std::unordered_set<map::VoxelKey, map::VoxelKeyHash> no_rays;
+  tracker.update({voxelSnapshot(10, 0, 0, 0u, 1.0f, true)}, no_rays,
+                 stamp(1.0));
+
+  std::vector<map::VoxelSnapshot> terrain{
+    voxelSnapshot(10, 0, 0, 1u, 0.05f, true)};
+  terrain.front().last_observed = stamp(1.1);
+  EXPECT_TRUE(tracker.update(terrain, no_rays, stamp(1.1))
+                .revoked_free.empty());
+
+  map::VoxelSnapshot ambiguous = voxelSnapshot(10, 0, 0, 0u, 1.0f, true);
+  ambiguous.measured_traversability_cost = 0.20f;
+  EXPECT_TRUE(tracker.update({ambiguous}, no_rays, stamp(1.2))
+                .revoked_free.empty());
+
+  terrain.front().last_observed = stamp(1.3);
+  const map::ObstacleRevocationResult result =
+    tracker.update(terrain, no_rays, stamp(1.3));
+  ASSERT_EQ(1u, result.revoked_free.size());
+  EXPECT_EQ(2u, result.revoked_free.front().evidence_frames);
+  EXPECT_DOUBLE_EQ(2.0, result.revoked_free.front().evidence_score);
+}
+
+TEST(ObstacleRevocation, HighCostAmbiguousLabelResetsFreeEvidence)
+{
+  map::ObstacleRevocationConfig config;
+  config.minimum_free_frames = 2u;
+  config.minimum_free_evidence = 2.0;
+  config.minimum_free_duration = 0.1;
+  config.free_evidence_decay_per_second = 0.0;
+  config.obstacle_labels = {0u, 2u};
+  config.terrain_labels = {1u};
+  config.ambiguous_obstacle_labels = {0u};
+  config.ambiguous_obstacle_reset_min_traversability = 0.65f;
+  map::ObstacleRevocationTracker tracker(config);
+  const std::unordered_set<map::VoxelKey, map::VoxelKeyHash> no_rays;
+  tracker.update({voxelSnapshot(10, 0, 0, 0u, 1.0f, true)}, no_rays,
+                 stamp(1.0));
+
+  std::vector<map::VoxelSnapshot> terrain{
+    voxelSnapshot(10, 0, 0, 1u, 0.05f, true)};
+  terrain.front().last_observed = stamp(1.1);
+  tracker.update(terrain, no_rays, stamp(1.1));
+
+  map::VoxelSnapshot obstacle = voxelSnapshot(10, 0, 0, 0u, 1.0f, true);
+  obstacle.measured_traversability_cost = 0.80f;
+  tracker.update({obstacle}, no_rays, stamp(1.2));
+
+  terrain.front().last_observed = stamp(1.3);
+  EXPECT_TRUE(tracker.update(terrain, no_rays, stamp(1.3))
+                .revoked_free.empty());
+  terrain.front().last_observed = stamp(1.4);
+  EXPECT_EQ(1u, tracker.update(terrain, no_rays, stamp(1.4))
+                  .revoked_free.size());
+}
+
+TEST(ObstacleRevocation, MissingEvidenceDecaysInsteadOfCountingAsFree)
+{
+  map::ObstacleRevocationConfig config;
+  config.minimum_free_frames = 2u;
+  config.minimum_free_evidence = 1.5;
+  config.minimum_free_duration = 0.0;
+  config.free_evidence_decay_per_second = 1.0;
+  map::ObstacleRevocationTracker tracker(config);
+  const std::unordered_set<map::VoxelKey, map::VoxelKeyHash> no_rays;
+  tracker.update({voxelSnapshot(10, 0, 0, 2u, 0.95f)}, no_rays,
+                 stamp(1.0));
+
+  std::vector<map::VoxelSnapshot> terrain{
+    voxelSnapshot(10, 0, 0, 0u, 0.05f)};
+  terrain.front().last_observed = stamp(1.1);
+  tracker.update(terrain, no_rays, stamp(1.1));
+  tracker.update({}, no_rays, stamp(2.2));
+
+  terrain.front().last_observed = stamp(2.3);
+  EXPECT_TRUE(tracker.update(terrain, no_rays, stamp(2.3))
+                .revoked_free.empty());
+  terrain.front().last_observed = stamp(2.4);
+  EXPECT_EQ(1u, tracker.update(terrain, no_rays, stamp(2.4))
+                  .revoked_free.size());
+}
+
 TEST(ObstacleRevocation, RayTraversalClearsFalseStaticTrailButNotEndpoint)
 {
   map::ObstacleRevocationConfig config;
@@ -271,104 +365,360 @@ TEST(ObstacleRevocation, ExplicitBoundaryRelabelRevokesHigherCostManhole)
   EXPECT_EQ(0u, tracker.trackedCount());
 }
 
-TEST(TerrainBoundaryFilter, RelabelsThinSeamBetweenAnyTerrainClasses)
-{
-  for (const auto& labels : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
-         {1u, 2u}, {1u, 3u}, {2u, 4u}, {3u, 4u}})
-  {
-    map::TerrainBoundaryFilterConfig config;
-    config.enabled = true;
-    config.opening_radius_cells = 1u;
-    config.neighborhood_radius = 0.20;
-    config.vertical_tolerance = 0.0;
-    config.minimum_terrain_neighbors = 4u;
-    config.minimum_distinct_terrain_labels = 2u;
-    config.minimum_terrain_ratio = 0.70;
-    map::TerrainBoundaryFilter filter(config);
-    std::vector<map::VoxelSnapshot> voxels;
-    for (std::int32_t x = 0; x < 5; ++x)
-    {
-      for (std::int32_t y = 0; y < 5; ++y)
-      {
-        const std::uint32_t label = x < 2 ? labels.first :
-          (x == 2 ? 0u : labels.second);
-        const float cost = label == 0u ? 1.0f :
-          (label == labels.first ? 0.10f : 0.30f);
-        voxels.push_back(voxelSnapshot(x, y, 0, label, cost, true));
-      }
-    }
-
-    const map::TerrainBoundaryFilterResult result =
-      filter.filter(voxels, 0.10, 0.10);
-    ASSERT_EQ(5u, result.relabeled.size());
-    EXPECT_TRUE(std::none_of(result.voxels.begin(), result.voxels.end(),
-      [](const map::VoxelSnapshot& voxel) { return voxel.label == 0u; }));
-    EXPECT_TRUE(std::all_of(result.voxels.begin(), result.voxels.end(),
-      [](const map::VoxelSnapshot& voxel)
-      {
-        return voxel.label != 0u || voxel.traversability_cost < 0.60f;
-      }));
-  }
-}
-
-TEST(TerrainBoundaryFilter, KeepsDenseObstacleSurvivingOpening)
+TEST(TerrainBoundaryFilter, RecoversAllConfiguredStaticRoles)
 {
   map::TerrainBoundaryFilterConfig config;
   config.enabled = true;
-  config.neighborhood_radius = 0.30;
-  config.vertical_tolerance = 0.0;
-  config.minimum_terrain_neighbors = 4u;
-  config.minimum_terrain_ratio = 0.50;
-  map::TerrainBoundaryFilter filter(config);
+  config.terrain_labels = {1u, 2u, 3u};
+  config.recoverable_labels = {0u, 4u};
+  config.closing_radius = 0.10;
+  config.maximum_height_difference = 0.10;
+
   std::vector<map::VoxelSnapshot> voxels;
   for (std::int32_t x = 0; x < 7; ++x)
   {
-    for (std::int32_t y = 0; y < 7; ++y)
+    for (std::int32_t y = 0; y < 5; ++y)
     {
-      const bool obstacle = x >= 2 && x <= 4 && y >= 2 && y <= 4;
-      const std::uint32_t label = obstacle ? 0u : (x < 3 ? 1u : 2u);
-      voxels.push_back(voxelSnapshot(
-        x, y, 0, label, obstacle ? 1.0f : 0.20f, true));
+      const std::uint32_t label =
+        x == 2 && y == 2 ? 0u : (x == 4 && y == 2 ? 4u : 1u);
+      voxels.push_back(voxelSnapshot(x, y, 0, label, label == 1u ? 0.05f : 1.0f));
     }
   }
 
   const map::TerrainBoundaryFilterResult result =
-    filter.filter(voxels, 0.10, 0.10);
-  EXPECT_TRUE(result.relabeled.empty());
-  EXPECT_EQ(9u, std::count_if(result.voxels.begin(), result.voxels.end(),
-    [](const map::VoxelSnapshot& voxel) { return voxel.label == 0u; }));
+    map::TerrainBoundaryFilter(config).filter(voxels, 0.10, 0.10);
+  ASSERT_EQ(2u, result.relabeled.size());
+  EXPECT_EQ(1u, result.relabeled[0].replacement_label);
+  EXPECT_EQ(1u, result.relabeled[1].replacement_label);
+  EXPECT_EQ(0u, std::count_if(result.voxels.begin(), result.voxels.end(),
+    [](const map::VoxelSnapshot& voxel)
+    {
+      return voxel.label == 0u || voxel.label == 4u;
+    }));
 }
 
-TEST(TerrainBoundaryFilter, KeepsSpotInsideOneTerrainClassAndUnknown)
+TEST(TerrainBoundaryFilter, ExcludesDynamicRoleEvenInsideClosedHole)
 {
   map::TerrainBoundaryFilterConfig config;
   config.enabled = true;
-  config.neighborhood_radius = 0.20;
-  config.vertical_tolerance = 0.0;
-  config.minimum_terrain_neighbors = 4u;
-  map::TerrainBoundaryFilter filter(config);
+  config.terrain_labels = {1u};
+  config.recoverable_labels = {0u, 4u};
+  config.excluded_labels = {11u};
+  config.closing_radius = 0.10;
+  config.debug_enabled = true;
+
   std::vector<map::VoxelSnapshot> voxels;
   for (std::int32_t x = 0; x < 5; ++x)
   {
     for (std::int32_t y = 0; y < 5; ++y)
     {
-      const std::uint32_t label = (x == 2 && y == 2) ? 0u : 1u;
-      voxels.push_back(voxelSnapshot(x, y, 0, label,
-                                    label == 0u ? 1.0f : 0.05f, true));
+      voxels.push_back(voxelSnapshot(
+        x, y, 0, x == 2 && y == 2 ? 11u : 1u));
     }
   }
-  voxels.push_back(voxelSnapshot(6, 2, 0, map::kInvalidSemanticLabel));
 
   const map::TerrainBoundaryFilterResult result =
-    filter.filter(voxels, 0.10, 0.10);
+    map::TerrainBoundaryFilter(config).filter(voxels, 0.10, 0.10);
   EXPECT_TRUE(result.relabeled.empty());
+  EXPECT_EQ(1u, result.debug_statistics.excluded_voxels);
   EXPECT_EQ(1u, std::count_if(result.voxels.begin(), result.voxels.end(),
-    [](const map::VoxelSnapshot& voxel) { return voxel.label == 0u; }));
-  EXPECT_EQ(1u, std::count_if(result.voxels.begin(), result.voxels.end(),
+    [](const map::VoxelSnapshot& voxel) { return voxel.label == 11u; }));
+}
+
+TEST(TerrainBoundaryFilter, NeverCreatesVoxelForUnobservedClosedHole)
+{
+  map::TerrainBoundaryFilterConfig config;
+  config.enabled = true;
+  config.terrain_labels = {1u};
+  config.recoverable_labels = {0u};
+  config.closing_radius = 0.10;
+  std::vector<map::VoxelSnapshot> voxels;
+  for (std::int32_t x = 0; x < 5; ++x)
+  {
+    for (std::int32_t y = 0; y < 5; ++y)
+    {
+      if (x != 2 || y != 2)
+      {
+        voxels.push_back(voxelSnapshot(x, y, 0, 1u));
+      }
+    }
+  }
+
+  const map::TerrainBoundaryFilterResult result =
+    map::TerrainBoundaryFilter(config).filter(voxels, 0.10, 0.10);
+  EXPECT_TRUE(result.relabeled.empty());
+  EXPECT_EQ(voxels.size(), result.voxels.size());
+  EXPECT_TRUE(std::none_of(result.voxels.begin(), result.voxels.end(),
     [](const map::VoxelSnapshot& voxel)
     {
-      return voxel.label == map::kInvalidSemanticLabel;
+      return voxel.key == map::VoxelKey{2, 2, 0};
     }));
+}
+
+TEST(TerrainBoundaryFilter, RecoversStaticVoxelSharingTerrainXyColumn)
+{
+  map::TerrainBoundaryFilterConfig config;
+  config.enabled = true;
+  config.terrain_labels = {1u};
+  config.recoverable_labels = {0u};
+  config.closing_radius = 0.10;
+  config.maximum_height_difference = 0.15;
+  config.debug_enabled = true;
+
+  std::vector<map::VoxelSnapshot> voxels;
+  for (std::int32_t x = 0; x < 5; ++x)
+  {
+    for (std::int32_t y = 0; y < 5; ++y)
+    {
+      voxels.push_back(voxelSnapshot(x, y, 0, 1u));
+    }
+  }
+  // The terrain projection at this XY is already white because of z=0. The
+  // static voxel at z=1 must still reach the height gate and be recovered.
+  voxels.push_back(voxelSnapshot(2, 2, 1, 0u, 1.0f));
+
+  const map::TerrainBoundaryFilterResult result =
+    map::TerrainBoundaryFilter(config).filter(voxels, 0.10, 0.10);
+  ASSERT_EQ(1u, result.relabeled.size());
+  EXPECT_EQ((map::VoxelKey{2, 2, 1}), result.relabeled.front().key);
+  EXPECT_EQ(1u, result.relabeled.front().replacement_label);
+  ASSERT_EQ(1u, result.debug_records.size());
+  const map::TerrainBoundaryDebugRecord& record = result.debug_records.front();
+  EXPECT_TRUE(record.closed_terrain);
+  EXPECT_TRUE(record.proposed);
+  EXPECT_TRUE(record.reference_found);
+  EXPECT_EQ((map::VoxelKey{2, 2, 0}), record.reference_key);
+  EXPECT_NEAR(0.10, record.height_difference, 1e-9);
+  EXPECT_EQ(map::TerrainBoundaryDecisionReason::Recovered,
+            record.first_failure);
+  EXPECT_EQ(0u, result.debug_statistics.opencv_newly_filled_cells);
+  EXPECT_EQ(1u, result.debug_statistics.opencv_proposed_cells);
+  EXPECT_EQ(1u, result.debug_statistics.opencv_proposed_voxels);
+}
+
+TEST(TerrainBoundaryFilter, HeightGateKeepsRaisedStaticObstacle)
+{
+  map::TerrainBoundaryFilterConfig config;
+  config.enabled = true;
+  config.terrain_labels = {1u};
+  config.recoverable_labels = {0u, 4u};
+  config.closing_radius = 0.10;
+  config.maximum_height_difference = 0.10;
+  config.debug_enabled = true;
+
+  std::vector<map::VoxelSnapshot> voxels;
+  for (std::int32_t x = 0; x < 5; ++x)
+  {
+    for (std::int32_t y = 0; y < 5; ++y)
+    {
+      voxels.push_back(voxelSnapshot(x, y, 0, 1u));
+    }
+  }
+  // This raised static voxel shares its XY column with original terrain. It
+  // is proposed by the closed support but must still fail the height gate.
+  voxels.push_back(voxelSnapshot(2, 2, 2, 4u, 1.0f));
+
+  const map::TerrainBoundaryFilterResult result =
+    map::TerrainBoundaryFilter(config).filter(voxels, 0.10, 0.10);
+  EXPECT_TRUE(result.relabeled.empty());
+  ASSERT_EQ(1u, result.debug_records.size());
+  EXPECT_TRUE(result.debug_records.front().proposed);
+  EXPECT_TRUE(result.debug_records.front().reference_found);
+  EXPECT_EQ((map::VoxelKey{2, 2, 0}),
+            result.debug_records.front().reference_key);
+  EXPECT_NEAR(0.20, result.debug_records.front().height_difference, 1e-9);
+  EXPECT_EQ(map::TerrainBoundaryDecisionReason::HeightDifferenceTooHigh,
+            result.debug_records.front().first_failure);
+}
+
+TEST(TerrainBoundaryFilter, ClosingRadiusControlsRecovery)
+{
+  std::vector<map::VoxelSnapshot> voxels;
+  for (std::int32_t x = 0; x < 5; ++x)
+  {
+    for (std::int32_t y = 0; y < 5; ++y)
+    {
+      voxels.push_back(voxelSnapshot(
+        x, y, 0, x == 2 && y == 2 ? 0u : 1u));
+    }
+  }
+
+  map::TerrainBoundaryFilterConfig disabled_radius;
+  disabled_radius.enabled = true;
+  disabled_radius.terrain_labels = {1u};
+  disabled_radius.recoverable_labels = {0u};
+  disabled_radius.closing_radius = 0.0;
+  EXPECT_TRUE(map::TerrainBoundaryFilter(disabled_radius)
+    .filter(voxels, 0.10, 0.10).relabeled.empty());
+
+  map::TerrainBoundaryFilterConfig enabled_radius = disabled_radius;
+  enabled_radius.closing_radius = 0.10;
+  EXPECT_EQ(1u, map::TerrainBoundaryFilter(enabled_radius)
+    .filter(voxels, 0.10, 0.10).relabeled.size());
+}
+
+TEST(TerrainBoundaryFilter, TerrainRoleListControlsReferenceLabel)
+{
+  std::vector<map::VoxelSnapshot> voxels;
+  for (std::int32_t x = 0; x < 5; ++x)
+  {
+    for (std::int32_t y = 0; y < 5; ++y)
+    {
+      voxels.push_back(voxelSnapshot(
+        x, y, 0, x == 2 && y == 2 ? 0u : 2u,
+        x == 2 && y == 2 ? 1.0f : 0.20f));
+    }
+  }
+
+  map::TerrainBoundaryFilterConfig blocked;
+  blocked.enabled = true;
+  blocked.terrain_labels = {1u};
+  blocked.recoverable_labels = {0u};
+  blocked.closing_radius = 0.10;
+  EXPECT_TRUE(map::TerrainBoundaryFilter(blocked)
+    .filter(voxels, 0.10, 0.10).relabeled.empty());
+
+  map::TerrainBoundaryFilterConfig allowed = blocked;
+  allowed.terrain_labels = {2u};
+  const map::TerrainBoundaryFilterResult result =
+    map::TerrainBoundaryFilter(allowed).filter(voxels, 0.10, 0.10);
+  ASSERT_EQ(1u, result.relabeled.size());
+  EXPECT_EQ(2u, result.relabeled.front().replacement_label);
+}
+
+TEST(TerrainBoundaryFilter, CopiesNearestTerrainSemanticAndCosts)
+{
+  map::TerrainBoundaryFilterConfig config;
+  config.enabled = true;
+  config.terrain_labels = {2u};
+  config.recoverable_labels = {4u};
+  config.closing_radius = 0.10;
+
+  std::vector<map::VoxelSnapshot> voxels;
+  for (std::int32_t x = 0; x < 5; ++x)
+  {
+    for (std::int32_t y = 0; y < 5; ++y)
+    {
+      voxels.push_back(voxelSnapshot(
+        x, y, 0, x == 2 && y == 2 ? 4u : 2u,
+        x == 2 && y == 2 ? 1.0f : 0.27f, true));
+    }
+  }
+  for (map::VoxelSnapshot& voxel : voxels)
+  {
+    if (voxel.label == 2u)
+    {
+      voxel.semantic_confidence = 0.73f;
+      voxel.semantic_cost = 0.20f;
+    }
+  }
+
+  const map::TerrainBoundaryFilterResult result =
+    map::TerrainBoundaryFilter(config).filter(voxels, 0.10, 0.10);
+  const auto recovered = std::find_if(
+    result.voxels.begin(), result.voxels.end(),
+    [](const map::VoxelSnapshot& voxel)
+    {
+      return voxel.key == map::VoxelKey{2, 2, 0};
+    });
+  ASSERT_NE(result.voxels.end(), recovered);
+  EXPECT_EQ(2u, recovered->label);
+  EXPECT_FLOAT_EQ(0.73f, recovered->semantic_confidence);
+  EXPECT_FLOAT_EQ(0.20f, recovered->semantic_cost);
+  EXPECT_FLOAT_EQ(0.27f, recovered->traversability_cost);
+  EXPECT_TRUE(recovered->has_measured_traversability);
+  EXPECT_FLOAT_EQ(0.27f, recovered->measured_traversability_cost);
+}
+
+TEST(TerrainBoundaryFilter, DebugMatchesSimplifiedMorphologyStages)
+{
+  map::TerrainBoundaryFilterConfig config;
+  config.enabled = true;
+  config.terrain_labels = {1u};
+  config.recoverable_labels = {0u};
+  config.excluded_labels = {11u};
+  config.closing_radius = 0.20;
+  config.maximum_height_difference = 0.10;
+  config.debug_enabled = true;
+
+  std::vector<map::VoxelSnapshot> voxels;
+  for (std::int32_t x = 0; x < 5; ++x)
+  {
+    for (std::int32_t y = 0; y < 5; ++y)
+    {
+      voxels.push_back(voxelSnapshot(
+        x, y, 0, x == 2 && y == 2 ? 0u : 1u));
+    }
+  }
+  voxels.push_back(voxelSnapshot(6, 2, 0, 11u));
+
+  const map::TerrainBoundaryFilterResult result =
+    map::TerrainBoundaryFilter(config).filter(voxels, 0.10, 0.10);
+  ASSERT_EQ(1u, result.relabeled.size());
+  ASSERT_EQ(1u, result.debug_records.size());
+  const map::TerrainBoundaryDebugRecord& record = result.debug_records.front();
+  EXPECT_EQ(map::TerrainBoundaryDecisionReason::Recovered,
+            record.first_failure);
+  EXPECT_TRUE(record.proposed);
+  EXPECT_TRUE(record.reference_found);
+  EXPECT_EQ(1u, record.reference_label);
+  EXPECT_LE(record.height_difference, config.maximum_height_difference);
+  EXPECT_EQ(2, result.debug_statistics.closing_radius_cells);
+  EXPECT_EQ(1, result.debug_statistics.maximum_height_difference_cells);
+  EXPECT_GE(result.debug_statistics.opencv_newly_filled_cells, 1u);
+  EXPECT_EQ(1u, result.debug_statistics.opencv_proposed_cells);
+  EXPECT_EQ(1u, result.debug_statistics.opencv_proposed_voxels);
+  ASSERT_EQ(1u, result.debug_layers.size());
+  const map::TerrainBoundaryLayerDebug& layer = result.debug_layers.front();
+  const std::size_t expected_size = static_cast<std::size_t>(layer.rows) *
+    static_cast<std::size_t>(layer.columns);
+  EXPECT_EQ(expected_size, layer.terrain_original.size());
+  EXPECT_EQ(expected_size, layer.terrain_after_dilation.size());
+  EXPECT_EQ(expected_size, layer.terrain_after_erosion.size());
+  EXPECT_EQ(expected_size, layer.recoverable_static.size());
+  EXPECT_EQ(expected_size, layer.excluded.size());
+  EXPECT_EQ(expected_size, layer.newly_filled.size());
+  EXPECT_EQ(expected_size, layer.proposed.size());
+  EXPECT_EQ(expected_size, layer.reference_found.size());
+  EXPECT_EQ(expected_size, layer.recovered.size());
+}
+
+TEST(TerrainBoundaryFilter, DebugDoesNotChangeNavigationOutput)
+{
+  map::TerrainBoundaryFilterConfig plain_config;
+  plain_config.enabled = true;
+  plain_config.terrain_labels = {1u};
+  plain_config.recoverable_labels = {0u};
+  plain_config.closing_radius = 0.10;
+
+  std::vector<map::VoxelSnapshot> voxels;
+  for (std::int32_t x = 0; x < 5; ++x)
+  {
+    for (std::int32_t y = 0; y < 5; ++y)
+    {
+      voxels.push_back(voxelSnapshot(
+        x, y, 0, x == 2 && y == 2 ? 0u : 1u));
+    }
+  }
+
+  const map::TerrainBoundaryFilterResult plain =
+    map::TerrainBoundaryFilter(plain_config).filter(voxels, 0.10, 0.10);
+  map::TerrainBoundaryFilterConfig debug_config = plain_config;
+  debug_config.debug_enabled = true;
+  const map::TerrainBoundaryFilterResult debug =
+    map::TerrainBoundaryFilter(debug_config).filter(voxels, 0.10, 0.10);
+  ASSERT_EQ(plain.relabeled.size(), debug.relabeled.size());
+  ASSERT_EQ(plain.voxels.size(), debug.voxels.size());
+  for (std::size_t index = 0u; index < plain.voxels.size(); ++index)
+  {
+    EXPECT_EQ(plain.voxels[index].label, debug.voxels[index].label);
+    EXPECT_FLOAT_EQ(plain.voxels[index].traversability_cost,
+                    debug.voxels[index].traversability_cost);
+  }
+  EXPECT_TRUE(plain.debug_records.empty());
+  EXPECT_TRUE(plain.debug_layers.empty());
+  EXPECT_FALSE(debug.debug_records.empty());
+  EXPECT_FALSE(debug.debug_layers.empty());
 }
 
 TEST(TerrainHeightCost, RaisesBothSidesOfMissingCostTerrainStep)
@@ -514,6 +864,26 @@ TEST(TerrainHeightCost, LeavesFlatMeasuredAndNonTerrainVoxelsUnchanged)
     voxelSnapshot(0, 0, 0, 2u),
     voxelSnapshot(1, 0, 3, 3u)};
   EXPECT_EQ(0u, map::applyTerrainHeightDiscontinuityCost(obstacles, 0.10, config));
+}
+
+TEST(TerrainHeightCost, UsesConfiguredTerrainLabels)
+{
+  std::vector<map::VoxelSnapshot> voxels{
+    voxelSnapshot(0, 0, 0, 2u),
+    voxelSnapshot(1, 0, 2, 3u)};
+
+  map::TerrainHeightCostConfig legacy_config;
+  legacy_config.enabled = true;
+  std::vector<map::VoxelSnapshot> legacy_result = voxels;
+  EXPECT_EQ(0u, map::applyTerrainHeightDiscontinuityCost(
+    legacy_result, 0.10, legacy_config));
+
+  map::TerrainHeightCostConfig shared_role_config = legacy_config;
+  shared_role_config.terrain_labels = {1u, 2u, 3u};
+  EXPECT_EQ(2u, map::applyTerrainHeightDiscontinuityCost(
+    voxels, 0.10, shared_role_config));
+  EXPECT_FLOAT_EQ(1.0f, voxels[0].traversability_cost);
+  EXPECT_FLOAT_EQ(1.0f, voxels[1].traversability_cost);
 }
 
 TEST(LocalAdmissionFilter, RetainsAllNonDynamicVoxels)

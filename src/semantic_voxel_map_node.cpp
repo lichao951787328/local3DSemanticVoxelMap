@@ -4,9 +4,14 @@
 #include "local3d_semantic_voxel_map/ssmi_semantic_encoding.hpp"
 #include "local3d_semantic_voxel_map/terrain_boundary_filter.hpp"
 
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
+
 #include <geometry_msgs/Point.h>
+#include <geometry_msgs/PointStamped.h>
 #include <geometry_msgs/TransformStamped.h>
 #include <ros/ros.h>
+#include <sensor_msgs/Image.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
 #include <std_srvs/Empty.h>
@@ -22,8 +27,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -38,6 +46,32 @@ namespace local3d_semantic_voxel_map
 
 namespace
 {
+
+constexpr int kBoundaryDebugPanelPixels = 260;
+constexpr int kBoundaryDebugPanelHeaderPixels = 26;
+constexpr int kBoundaryDebugPanelGap = 6;
+constexpr int kBoundaryDebugPanelCellHeight =
+  kBoundaryDebugPanelPixels + kBoundaryDebugPanelHeaderPixels;
+constexpr int kBoundaryDebugFooterPixels = 100;
+
+std::array<std::uint8_t, 3> boundaryDebugReasonRgb(
+  const TerrainBoundaryDecisionReason reason)
+{
+  switch (reason)
+  {
+    case TerrainBoundaryDecisionReason::OutsideClosedTerrainSupport:
+      return {{110u, 110u, 110u}};
+    case TerrainBoundaryDecisionReason::NoTerrainReference:
+      return {{0u, 128u, 255u}};
+    case TerrainBoundaryDecisionReason::HeightDifferenceTooHigh:
+      return {{255u, 165u, 0u}};
+    case TerrainBoundaryDecisionReason::Recovered:
+      return {{0u, 255u, 0u}};
+    case TerrainBoundaryDecisionReason::Count:
+      break;
+  }
+  return {{255u, 255u, 255u}};
+}
 
 struct FieldView
 {
@@ -199,6 +233,172 @@ std::vector<std::uint32_t> loadLabelList(
   return labels;
 }
 
+bool xmlBool(const XmlRpc::XmlRpcValue& value, const std::string& context)
+{
+  if (value.getType() != XmlRpc::XmlRpcValue::TypeBoolean)
+  {
+    throw std::runtime_error(context + " must be a boolean");
+  }
+  return static_cast<bool>(value);
+}
+
+struct SharedNavigationSemanticClass
+{
+  std::uint32_t label = 0u;
+  std::string name;
+  std::string role;
+  std::array<std::uint8_t, 3> rgb{{127u, 127u, 127u}};
+  float semantic_cost = 0.5f;
+};
+
+struct SharedNavigationSemanticProfile
+{
+  bool enabled = false;
+  std::string label_field = "semantic_lable";
+  std::string traversability_field = "traversability";
+  std::vector<SharedNavigationSemanticClass> classes;
+};
+
+SharedNavigationSemanticProfile loadSharedNavigationSemanticProfile(
+  const ros::NodeHandle& node)
+{
+  SharedNavigationSemanticProfile profile;
+  XmlRpc::XmlRpcValue root;
+  if (!node.getParam("/semantic_schema", root))
+  {
+    return profile;
+  }
+  if (root.getType() != XmlRpc::XmlRpcValue::TypeStruct)
+  {
+    throw std::runtime_error("/semantic_schema must be a YAML mapping");
+  }
+  if (!root.hasMember("navigation"))
+  {
+    return profile;
+  }
+  const XmlRpc::XmlRpcValue& navigation = root["navigation"];
+  if (navigation.getType() != XmlRpc::XmlRpcValue::TypeStruct)
+  {
+    throw std::runtime_error("/semantic_schema/navigation must be a mapping");
+  }
+  if (!navigation.hasMember("derive_runtime_roles") ||
+      !xmlBool(navigation["derive_runtime_roles"],
+               "/semantic_schema/navigation/derive_runtime_roles"))
+  {
+    return profile;
+  }
+
+  if (root.hasMember("input"))
+  {
+    const XmlRpc::XmlRpcValue& input = root["input"];
+    if (input.getType() != XmlRpc::XmlRpcValue::TypeStruct)
+    {
+      throw std::runtime_error("/semantic_schema/input must be a mapping");
+    }
+    if (input.hasMember("label_field"))
+    {
+      if (input["label_field"].getType() != XmlRpc::XmlRpcValue::TypeString)
+      {
+        throw std::runtime_error(
+          "/semantic_schema/input/label_field must be a string");
+      }
+      profile.label_field = static_cast<std::string>(input["label_field"]);
+    }
+    if (input.hasMember("traversability_field"))
+    {
+      if (input["traversability_field"].getType() !=
+          XmlRpc::XmlRpcValue::TypeString)
+      {
+        throw std::runtime_error(
+          "/semantic_schema/input/traversability_field must be a string");
+      }
+      profile.traversability_field =
+        static_cast<std::string>(input["traversability_field"]);
+    }
+  }
+  if (profile.label_field.empty() || profile.traversability_field.empty())
+  {
+    throw std::runtime_error(
+      "/semantic_schema input field names must not be empty");
+  }
+  if (!root.hasMember("classes") ||
+      root["classes"].getType() != XmlRpc::XmlRpcValue::TypeArray ||
+      root["classes"].size() == 0)
+  {
+    throw std::runtime_error(
+      "/semantic_schema/classes must be a non-empty YAML list");
+  }
+
+  const XmlRpc::XmlRpcValue& classes = root["classes"];
+  std::unordered_set<std::uint32_t> labels;
+  profile.classes.reserve(classes.size());
+  for (int index = 0; index < classes.size(); ++index)
+  {
+    const XmlRpc::XmlRpcValue& item = classes[index];
+    const std::string context = "/semantic_schema/classes[" +
+      std::to_string(index) + "]";
+    if (item.getType() != XmlRpc::XmlRpcValue::TypeStruct ||
+        !item.hasMember("label") || !item.hasMember("name") ||
+        !item.hasMember("rgb") || !item.hasMember("role") ||
+        !item.hasMember("semantic_cost"))
+    {
+      throw std::runtime_error(
+        context + " requires label, name, rgb, role, and semantic_cost");
+    }
+
+    SharedNavigationSemanticClass semantic_class;
+    semantic_class.label = parseLabel(item["label"]);
+    if (!labels.insert(semantic_class.label).second)
+    {
+      throw std::runtime_error(
+        context + " duplicates semantic label " +
+        std::to_string(semantic_class.label));
+    }
+    if (item["name"].getType() != XmlRpc::XmlRpcValue::TypeString ||
+        item["role"].getType() != XmlRpc::XmlRpcValue::TypeString)
+    {
+      throw std::runtime_error(context + " name and role must be strings");
+    }
+    semantic_class.name = static_cast<std::string>(item["name"]);
+    semantic_class.role = static_cast<std::string>(item["role"]);
+    if (semantic_class.name.empty() ||
+        (semantic_class.role != "terrain" &&
+         semantic_class.role != "static_obstacle" &&
+         semantic_class.role != "dynamic_obstacle" &&
+         semantic_class.role != "ignore"))
+    {
+      throw std::runtime_error(
+        context + " has an empty name or unsupported role");
+    }
+
+    const XmlRpc::XmlRpcValue& rgb = item["rgb"];
+    if (rgb.getType() != XmlRpc::XmlRpcValue::TypeArray || rgb.size() != 3)
+    {
+      throw std::runtime_error(context + "/rgb must be [r, g, b]");
+    }
+    for (int channel = 0; channel < 3; ++channel)
+    {
+      const double value = xmlNumber(rgb[channel]);
+      if (value < 0.0 || value > 255.0 || std::floor(value) != value)
+      {
+        throw std::runtime_error(
+          context + "/rgb channels must be integer values in [0, 255]");
+      }
+      semantic_class.rgb[static_cast<std::size_t>(channel)] =
+        static_cast<std::uint8_t>(value);
+    }
+    const double semantic_cost = xmlNumber(item["semantic_cost"]);
+    if (semantic_cost < 0.0 || semantic_cost > 1.0)
+    {
+      throw std::runtime_error(context + "/semantic_cost must be in [0, 1]");
+    }
+    semantic_class.semantic_cost = static_cast<float>(semantic_cost);
+    profile.classes.push_back(semantic_class);
+  }
+  profile.enabled = true;
+  return profile;
+}
+
 }  // namespace
 
 class SemanticVoxelMapNode
@@ -252,6 +452,7 @@ public:
     private_nh_.param("semantic_new_class_prior",
                       map_config.semantic_fusion.new_class_prior, 0.8f);
 
+    shared_semantic_profile_ = loadSharedNavigationSemanticProfile(nh_);
     map_.reset(new SemanticVoxelMap(map_config));
     map_->setSemanticClasses(loadSemanticClasses());
 
@@ -267,6 +468,11 @@ public:
     private_nh_.param<std::string>("confidence_field", confidence_field_,
                                    "semantic_confidence");
     private_nh_.param<std::string>("cost_field", cost_field_, "traversability");
+    if (shared_semantic_profile_.enabled)
+    {
+      semantic_field_ = shared_semantic_profile_.label_field;
+      cost_field_ = shared_semantic_profile_.traversability_field;
+    }
     private_nh_.param<std::string>("map_file", map_file_,
                                    "/tmp/local3d_semantic_voxel_map.csv");
     private_nh_.param<std::string>("local_cost_frame", local_cost_frame_,
@@ -295,6 +501,13 @@ public:
       0u : static_cast<std::size_t>(revocation_minimum_frames);
     private_nh_.param("ssmi_revocation_minimum_free_duration",
                       revocation_config.minimum_free_duration, 0.5);
+    revocation_config.minimum_free_evidence =
+      static_cast<double>(revocation_config.minimum_free_frames);
+    private_nh_.param("ssmi_revocation_minimum_free_evidence",
+                      revocation_config.minimum_free_evidence,
+                      revocation_config.minimum_free_evidence);
+    private_nh_.param("ssmi_revocation_free_evidence_decay_per_second",
+                      revocation_config.free_evidence_decay_per_second, 0.5);
     private_nh_.param("ssmi_revocation_free_max_traversability",
                       revocation_config.free_max_traversability, 0.45f);
     revocation_config.obstacle_min_traversability =
@@ -309,9 +522,37 @@ public:
     revocation_config.obstacle_labels = loadLabelList(
       private_nh_, "ssmi_revocation_obstacle_labels",
       revocation_config.obstacle_labels);
+    revocation_config.ambiguous_obstacle_labels = loadLabelList(
+      private_nh_, "ssmi_revocation_ambiguous_obstacle_labels",
+      revocation_config.ambiguous_obstacle_labels);
+    private_nh_.param(
+      "ssmi_revocation_ambiguous_obstacle_reset_min_traversability",
+      revocation_config.ambiguous_obstacle_reset_min_traversability, 0.65f);
     revocation_config.dynamic_labels = loadLabelList(
       private_nh_, "ssmi_revocation_dynamic_labels",
       revocation_config.dynamic_labels);
+    if (shared_semantic_profile_.enabled)
+    {
+      revocation_config.terrain_labels.clear();
+      revocation_config.obstacle_labels.clear();
+      revocation_config.dynamic_labels.clear();
+      for (const SharedNavigationSemanticClass& semantic_class :
+           shared_semantic_profile_.classes)
+      {
+        if (semantic_class.role == "terrain")
+        {
+          revocation_config.terrain_labels.push_back(semantic_class.label);
+        }
+        else if (semantic_class.role == "static_obstacle")
+        {
+          revocation_config.obstacle_labels.push_back(semantic_class.label);
+        }
+        else if (semantic_class.role == "dynamic_obstacle")
+        {
+          revocation_config.dynamic_labels.push_back(semantic_class.label);
+        }
+      }
+    }
     private_nh_.param("ssmi_revocation_ray_evidence_enabled",
                       ssmi_revocation_ray_evidence_enabled_, false);
     private_nh_.param("ssmi_revocation_ray_point_stride",
@@ -329,59 +570,104 @@ public:
     TerrainBoundaryFilterConfig boundary_filter_config;
     private_nh_.param("terrain_boundary_filter_enabled",
                       boundary_filter_config.enabled, false);
-    int boundary_obstacle_label = static_cast<int>(
-      boundary_filter_config.obstacle_label);
-    private_nh_.param("terrain_boundary_obstacle_label",
-                      boundary_obstacle_label, boundary_obstacle_label);
-    if (boundary_obstacle_label < 0)
+    private_nh_.param("terrain_boundary_debug_opencv_enabled",
+                      terrain_boundary_debug_opencv_enabled_, false);
+    private_nh_.param("terrain_boundary_debug_rviz_enabled",
+                      terrain_boundary_debug_rviz_enabled_, false);
+    boundary_filter_config.debug_enabled =
+      terrain_boundary_debug_opencv_enabled_ ||
+      terrain_boundary_debug_rviz_enabled_;
+    private_nh_.param("terrain_boundary_debug_statistics_interval_frames",
+                      terrain_boundary_debug_statistics_interval_frames_, 10);
+    private_nh_.param("terrain_boundary_debug_max_samples_per_reason",
+                      terrain_boundary_debug_max_samples_per_reason_, 1);
+    private_nh_.param<std::string>("terrain_boundary_debug_clicked_point_topic",
+                      terrain_boundary_debug_clicked_point_topic_,
+                      "/clicked_point");
+    private_nh_.param("terrain_boundary_debug_clicked_point_radius",
+                      terrain_boundary_debug_clicked_point_radius_, 0.20);
+    private_nh_.param<std::string>("terrain_boundary_debug_csv_path",
+                      terrain_boundary_debug_csv_path_, "");
+    if (terrain_boundary_debug_opencv_enabled_)
+    {
+      const char* display = std::getenv("DISPLAY");
+      const char* wayland_display = std::getenv("WAYLAND_DISPLAY");
+      const bool have_x_display = display != nullptr && display[0] != '\0';
+      const bool have_wayland_display =
+        wayland_display != nullptr && wayland_display[0] != '\0';
+      if (!have_x_display && !have_wayland_display)
+      {
+        ROS_ERROR("~terrain_boundary_debug_opencv_enabled is true, "
+                  "but neither DISPLAY nor WAYLAND_DISPLAY is available; "
+                  "disabling the OpenCV window");
+        terrain_boundary_debug_opencv_enabled_ = false;
+        boundary_filter_config.debug_enabled =
+          terrain_boundary_debug_rviz_enabled_;
+      }
+    }
+    if (terrain_boundary_debug_statistics_interval_frames_ <= 0)
     {
       throw std::runtime_error(
-        "~terrain_boundary_obstacle_label must be non-negative");
+        "~terrain_boundary_debug_statistics_interval_frames must be positive");
     }
-    boundary_filter_config.obstacle_label =
-      static_cast<std::uint32_t>(boundary_obstacle_label);
+    if (terrain_boundary_debug_max_samples_per_reason_ < 0)
+    {
+      throw std::runtime_error(
+        "~terrain_boundary_debug_max_samples_per_reason must be non-negative");
+    }
+    if (!std::isfinite(terrain_boundary_debug_clicked_point_radius_) ||
+        terrain_boundary_debug_clicked_point_radius_ <= 0.0)
+    {
+      throw std::runtime_error(
+        "~terrain_boundary_debug_clicked_point_radius must be positive");
+    }
     boundary_filter_config.terrain_labels = loadLabelList(
       private_nh_, "terrain_boundary_terrain_labels",
       boundary_filter_config.terrain_labels);
-    int boundary_opening_radius = static_cast<int>(
-      boundary_filter_config.opening_radius_cells);
-    private_nh_.param("terrain_boundary_opening_radius_cells",
-                      boundary_opening_radius, boundary_opening_radius);
-    if (boundary_opening_radius < 0)
+    boundary_filter_config.recoverable_labels = loadLabelList(
+      private_nh_, "terrain_boundary_recoverable_labels",
+      boundary_filter_config.recoverable_labels);
+    boundary_filter_config.excluded_labels = loadLabelList(
+      private_nh_, "terrain_boundary_excluded_labels",
+      boundary_filter_config.excluded_labels);
+    if (shared_semantic_profile_.enabled)
     {
-      throw std::runtime_error(
-        "~terrain_boundary_opening_radius_cells must be non-negative");
+      boundary_filter_config.terrain_labels.clear();
+      boundary_filter_config.recoverable_labels.clear();
+      boundary_filter_config.excluded_labels.clear();
+      for (const SharedNavigationSemanticClass& semantic_class :
+           shared_semantic_profile_.classes)
+      {
+        if (semantic_class.role == "terrain")
+        {
+          boundary_filter_config.terrain_labels.push_back(semantic_class.label);
+        }
+        else if (semantic_class.role == "static_obstacle")
+        {
+          boundary_filter_config.recoverable_labels.push_back(
+            semantic_class.label);
+        }
+        else
+        {
+          boundary_filter_config.excluded_labels.push_back(
+            semantic_class.label);
+        }
+      }
+      if (boundary_filter_config.terrain_labels.empty())
+      {
+        throw std::runtime_error(
+          "/semantic_schema must define at least one terrain role");
+      }
+      if (boundary_filter_config.recoverable_labels.empty())
+      {
+        throw std::runtime_error(
+          "/semantic_schema must define at least one static_obstacle role");
+      }
     }
-    boundary_filter_config.opening_radius_cells =
-      static_cast<std::size_t>(boundary_opening_radius);
-    private_nh_.param("terrain_boundary_neighborhood_radius",
-                      boundary_filter_config.neighborhood_radius, 0.30);
-    private_nh_.param("terrain_boundary_vertical_tolerance",
-                      boundary_filter_config.vertical_tolerance, 0.15);
-    int boundary_minimum_neighbors = static_cast<int>(
-      boundary_filter_config.minimum_terrain_neighbors);
-    private_nh_.param("terrain_boundary_minimum_terrain_neighbors",
-                      boundary_minimum_neighbors, boundary_minimum_neighbors);
-    if (boundary_minimum_neighbors <= 0)
-    {
-      throw std::runtime_error(
-        "~terrain_boundary_minimum_terrain_neighbors must be positive");
-    }
-    boundary_filter_config.minimum_terrain_neighbors =
-      static_cast<std::size_t>(boundary_minimum_neighbors);
-    int boundary_minimum_labels = static_cast<int>(
-      boundary_filter_config.minimum_distinct_terrain_labels);
-    private_nh_.param("terrain_boundary_minimum_distinct_terrain_labels",
-                      boundary_minimum_labels, boundary_minimum_labels);
-    if (boundary_minimum_labels <= 0)
-    {
-      throw std::runtime_error(
-        "~terrain_boundary_minimum_distinct_terrain_labels must be positive");
-    }
-    boundary_filter_config.minimum_distinct_terrain_labels =
-      static_cast<std::size_t>(boundary_minimum_labels);
-    private_nh_.param("terrain_boundary_minimum_terrain_ratio",
-                      boundary_filter_config.minimum_terrain_ratio, 0.70);
+    private_nh_.param("terrain_boundary_closing_radius",
+                      boundary_filter_config.closing_radius, 0.15);
+    private_nh_.param("terrain_boundary_max_height_difference",
+                      boundary_filter_config.maximum_height_difference, 0.10);
     terrain_boundary_filter_.reset(
       new TerrainBoundaryFilter(boundary_filter_config));
     terrain_boundary_filter_config_ = boundary_filter_config;
@@ -395,6 +681,19 @@ public:
                       terrain_height_cost_config_.comparison_epsilon, 1e-6);
     private_nh_.param("terrain_height_obstacle_cost",
                       terrain_height_cost_config_.obstacle_cost, 1.0f);
+    if (shared_semantic_profile_.enabled)
+    {
+      terrain_height_cost_config_.terrain_labels.clear();
+      for (const SharedNavigationSemanticClass& semantic_class :
+           shared_semantic_profile_.classes)
+      {
+        if (semantic_class.role == "terrain")
+        {
+          terrain_height_cost_config_.terrain_labels.push_back(
+            semantic_class.label);
+        }
+      }
+    }
     private_nh_.param("default_semantic_confidence", default_confidence_, 1.0f);
     private_nh_.param("max_range", max_range_, 15.0);
     private_nh_.param("min_z", min_z_, -std::numeric_limits<double>::max());
@@ -528,14 +827,50 @@ public:
       "revoked_free", 1, true);
     revoked_reclassified_pub_ = private_nh_.advertise<sensor_msgs::PointCloud2>(
       "revoked_reclassified", 1, true);
+    if (terrain_boundary_debug_rviz_enabled_)
+    {
+      terrain_boundary_debug_decision_cloud_pub_ =
+        private_nh_.advertise<sensor_msgs::PointCloud2>(
+          "terrain_boundary_debug/decision_cloud", 1, true);
+      terrain_boundary_debug_image_pub_ = private_nh_.advertise<sensor_msgs::Image>(
+        "terrain_boundary_debug/stages_image", 1, true);
+    }
     cloud_sub_ = nh_.subscribe(input_topic_, 1,
                                &SemanticVoxelMapNode::cloudCallback, this);
+    if (terrain_boundary_debug_rviz_enabled_)
+    {
+      terrain_boundary_debug_clicked_point_sub_ = nh_.subscribe(
+        terrain_boundary_debug_clicked_point_topic_, 1,
+        &SemanticVoxelMapNode::terrainBoundaryClickedPointCallback, this);
+    }
     reset_service_ = private_nh_.advertiseService(
       "reset", &SemanticVoxelMapNode::resetCallback, this);
     save_service_ = private_nh_.advertiseService(
       "save_map", &SemanticVoxelMapNode::saveCallback, this);
     load_service_ = private_nh_.advertiseService(
       "load_map", &SemanticVoxelMapNode::loadCallback, this);
+
+    if ((terrain_boundary_debug_opencv_enabled_ ||
+         terrain_boundary_debug_rviz_enabled_) &&
+        !terrain_boundary_debug_csv_path_.empty())
+    {
+      terrain_boundary_debug_csv_.open(
+        terrain_boundary_debug_csv_path_, std::ios::out | std::ios::app);
+      if (!terrain_boundary_debug_csv_)
+      {
+        ROS_ERROR("Cannot open terrain-boundary debug CSV '%s'; CSV output disabled",
+                  terrain_boundary_debug_csv_path_.c_str());
+      }
+      else if (terrain_boundary_debug_csv_.tellp() == std::streampos(0))
+      {
+        terrain_boundary_debug_csv_
+          << "stamp,key_x,key_y,key_z,x,y,z,first_failure,failure_mask,"
+             "original_label,closed,proposed,reference_found,reference_key_x,"
+             "reference_key_y,reference_key_z,reference_x,reference_y,"
+             "reference_z,reference_label,reference_distance_xy,"
+             "height_difference,replacement_label\n";
+      }
+    }
 
     const double timer_period = publish_rate_ > 0.0 ? 1.0 / publish_rate_ : 0.5;
     publish_timer_ = nh_.createTimer(ros::Duration(timer_period),
@@ -580,34 +915,909 @@ public:
                ssmi_admitted_topic_.c_str(),
                ssmi_obstacle_traversability_threshold_);
     }
-    ROS_INFO("SSMI obstacle revocation: %s, ray evidence=%s, ray stride=%d",
+    ROS_INFO("SSMI obstacle revocation: %s, free_frames>=%zu, "
+             "free_evidence>=%.2f, evidence_decay=%.2f/s, "
+             "ambiguous_obstacles=%zu reset_cost>=%.2f, "
+             "ray evidence=%s, ray stride=%d",
              enable_ssmi_obstacle_revocation_ ? "enabled" : "disabled",
+             revocation_config.minimum_free_frames,
+             revocation_config.minimum_free_evidence,
+             revocation_config.free_evidence_decay_per_second,
+             revocation_config.ambiguous_obstacle_labels.size(),
+             revocation_config.ambiguous_obstacle_reset_min_traversability,
              ssmi_revocation_ray_evidence_enabled_ ? "enabled" : "disabled",
              ssmi_revocation_ray_point_stride_);
-    ROS_INFO("Terrain-boundary obstacle cleanup: %s, obstacle=%u, "
-             "terrain_classes=%zu, opening=%zu cell(s), neighborhood=%.2f m, "
-             "vertical=%.2f m, terrain_ratio>=%.2f, distinct_classes>=%zu",
+    ROS_INFO("Static-terrain morphology recovery: %s, terrain_classes=%zu, "
+             "recoverable_static_classes=%zu, excluded_classes=%zu, "
+             "closing_radius=%.2f m, height_difference<=%.2f m",
              terrain_boundary_filter_config_.enabled ? "enabled" : "disabled",
-             terrain_boundary_filter_config_.obstacle_label,
              terrain_boundary_filter_config_.terrain_labels.size(),
-             terrain_boundary_filter_config_.opening_radius_cells,
-             terrain_boundary_filter_config_.neighborhood_radius,
-             terrain_boundary_filter_config_.vertical_tolerance,
-             terrain_boundary_filter_config_.minimum_terrain_ratio,
-             terrain_boundary_filter_config_.minimum_distinct_terrain_labels);
+             terrain_boundary_filter_config_.recoverable_labels.size(),
+             terrain_boundary_filter_config_.excluded_labels.size(),
+             terrain_boundary_filter_config_.closing_radius,
+             terrain_boundary_filter_config_.maximum_height_difference);
+    ROS_INFO("Terrain-boundary debug: OpenCV=%s, RViz=%s, "
+             "statistics=%d frames, clicked_point=(%s, %.2f m), CSV=%s; "
+             "resolved closing radius=%d cells, "
+             "height threshold=%d cells",
+             terrain_boundary_debug_opencv_enabled_ ? "on" : "off",
+             terrain_boundary_debug_rviz_enabled_ ? "on" : "off",
+             terrain_boundary_debug_statistics_interval_frames_,
+             terrain_boundary_debug_clicked_point_topic_.c_str(),
+             terrain_boundary_debug_clicked_point_radius_,
+             terrain_boundary_debug_csv_path_.empty() ? "off" :
+               terrain_boundary_debug_csv_path_.c_str(),
+             static_cast<int>(std::ceil(
+               terrain_boundary_filter_config_.closing_radius /
+               map_->voxelSizeXY())),
+             static_cast<int>(std::ceil(
+               terrain_boundary_filter_config_.maximum_height_difference /
+               map_->voxelSizeZ())));
     ROS_INFO("Missing-cost terrain height inference: %s, dz>%.2f m + %.1e "
-             "within %.2f m -> cost %.2f (terrain labels 0/1/9 only)",
+             "within %.2f m -> cost %.2f (%zu configured terrain labels)",
              terrain_height_cost_config_.enabled ? "enabled" : "disabled",
              terrain_height_cost_config_.height_difference_threshold,
              terrain_height_cost_config_.comparison_epsilon,
              terrain_height_cost_config_.neighborhood_radius,
-             terrain_height_cost_config_.obstacle_cost);
+             terrain_height_cost_config_.obstacle_cost,
+             terrain_height_cost_config_.terrain_labels.size());
+  }
+
+  ~SemanticVoxelMapNode()
+  {
+    if (!terrain_boundary_opencv_window_initialized_)
+    {
+      return;
+    }
+    try
+    {
+      cv::destroyWindow(terrain_boundary_opencv_window_name_);
+    }
+    catch (const cv::Exception&)
+    {
+      // ROS is already shutting down; there is nothing useful to recover here.
+    }
   }
 
 private:
   const std::string& mapFrame() const
   {
     return use_initial_pose_reference_ ? reference_frame_ : global_frame_;
+  }
+
+  bool isTerrainBoundaryTerrainLabel(const std::uint32_t label) const
+  {
+    return std::find(terrain_boundary_filter_config_.terrain_labels.begin(),
+                     terrain_boundary_filter_config_.terrain_labels.end(),
+                     label) != terrain_boundary_filter_config_.terrain_labels.end();
+  }
+
+  bool isTerrainBoundaryRecoverableLabel(const std::uint32_t label) const
+  {
+    return std::find(terrain_boundary_filter_config_.recoverable_labels.begin(),
+                     terrain_boundary_filter_config_.recoverable_labels.end(),
+                     label) !=
+      terrain_boundary_filter_config_.recoverable_labels.end();
+  }
+
+  bool isConfiguredDynamicLabel(const std::uint32_t label) const
+  {
+    if (!shared_semantic_profile_.enabled)
+    {
+      return label >= 11u && label <= 18u;
+    }
+    return std::any_of(
+      shared_semantic_profile_.classes.begin(),
+      shared_semantic_profile_.classes.end(),
+      [label](const SharedNavigationSemanticClass& semantic_class)
+      {
+        return semantic_class.label == label &&
+               semantic_class.role == "dynamic_obstacle";
+      });
+  }
+
+  static cv::Mat boundaryDebugMaskImage(
+    const TerrainBoundaryLayerDebug& layer,
+    const std::vector<std::uint8_t>& mask,
+    const std::array<std::uint8_t, 3>& rgb)
+  {
+    cv::Mat image(layer.rows, layer.columns, CV_8UC3,
+                  cv::Scalar(24, 24, 24));
+    const std::size_t expected = static_cast<std::size_t>(layer.rows) *
+      static_cast<std::size_t>(layer.columns);
+    if (mask.size() == expected)
+    {
+      const cv::Vec3b bgr(rgb[2], rgb[1], rgb[0]);
+      for (int row = 0; row < layer.rows; ++row)
+      {
+        for (int column = 0; column < layer.columns; ++column)
+        {
+          const std::size_t index = static_cast<std::size_t>(row) *
+            layer.columns + column;
+          if (mask[index] != 0u)
+          {
+            image.at<cv::Vec3b>(row, column) = bgr;
+          }
+        }
+      }
+    }
+    cv::flip(image, image, 0);
+    return image;
+  }
+
+  static cv::Mat boundaryDebugPanel(
+    const cv::Mat& image, const std::string& title)
+  {
+    cv::Mat panel(kBoundaryDebugPanelCellHeight,
+                  kBoundaryDebugPanelPixels, CV_8UC3,
+                  cv::Scalar(24, 24, 24));
+    cv::Mat resized;
+    cv::resize(image, resized,
+               cv::Size(kBoundaryDebugPanelPixels, kBoundaryDebugPanelPixels),
+               0.0, 0.0, cv::INTER_NEAREST);
+    resized.copyTo(panel(cv::Rect(
+      0, kBoundaryDebugPanelHeaderPixels,
+      kBoundaryDebugPanelPixels, kBoundaryDebugPanelPixels)));
+    cv::putText(panel, title, cv::Point(5, 19),
+                cv::FONT_HERSHEY_SIMPLEX, 0.48,
+                cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+    return panel;
+  }
+
+  cv::Mat buildTerrainBoundaryDebugCanvas(
+    const TerrainBoundaryFilterResult& result, const std::size_t layer_index)
+  {
+    if (!terrain_boundary_debug_opencv_enabled_ &&
+        !terrain_boundary_debug_rviz_enabled_)
+    {
+      return cv::Mat();
+    }
+
+    if (result.debug_layers.empty())
+    {
+      cv::Mat empty(150, 900, CV_8UC3, cv::Scalar(24, 24, 24));
+      cv::putText(empty, "No recoverable static voxels in current local snapshot",
+                  cv::Point(24, 82), cv::FONT_HERSHEY_SIMPLEX, 0.70,
+                  cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
+      return empty;
+    }
+    const TerrainBoundaryLayerDebug& layer = result.debug_layers[
+      std::min(layer_index, result.debug_layers.size() - 1u)];
+    const std::array<std::uint8_t, 3> white{{255u, 255u, 255u}};
+    const std::array<std::uint8_t, 3> red{{255u, 0u, 0u}};
+    const std::array<std::uint8_t, 3> yellow{{255u, 255u, 0u}};
+    const std::array<std::uint8_t, 3> blue{{0u, 128u, 255u}};
+    const std::array<std::uint8_t, 3> green{{0u, 255u, 0u}};
+
+    std::array<cv::Mat, 9> images{{
+      boundaryDebugMaskImage(layer, layer.terrain_original, white),
+      boundaryDebugMaskImage(layer, layer.terrain_after_dilation, white),
+      boundaryDebugMaskImage(layer, layer.terrain_after_erosion, white),
+      boundaryDebugMaskImage(layer, layer.recoverable_static, red),
+      boundaryDebugMaskImage(layer, layer.excluded, red),
+      boundaryDebugMaskImage(layer, layer.newly_filled, yellow),
+      boundaryDebugMaskImage(layer, layer.proposed, yellow),
+      boundaryDebugMaskImage(layer, layer.reference_found, blue),
+      boundaryDebugMaskImage(layer, layer.recovered, green)
+    }};
+
+    const std::array<std::string, 9> titles{{
+      "1 terrain projection", "2 after dilation", "3 after erosion",
+      "4 recoverable static", "5 dynamic/ignore excluded", "6 newly white",
+      "7 supported static candidates", "8 terrain reference found",
+      "9 recovered"
+    }};
+    const int grid_width = 3 * kBoundaryDebugPanelPixels +
+      2 * kBoundaryDebugPanelGap;
+    const int grid_height = 3 * kBoundaryDebugPanelCellHeight +
+      2 * kBoundaryDebugPanelGap;
+    cv::Mat canvas(grid_height + kBoundaryDebugFooterPixels, grid_width,
+                   CV_8UC3, cv::Scalar(24, 24, 24));
+    for (int index = 0; index < 9; ++index)
+    {
+      const int grid_column = index % 3;
+      const int grid_row = index / 3;
+      const int x = grid_column *
+        (kBoundaryDebugPanelPixels + kBoundaryDebugPanelGap);
+      const int y = grid_row *
+        (kBoundaryDebugPanelCellHeight + kBoundaryDebugPanelGap);
+      boundaryDebugPanel(images[static_cast<std::size_t>(index)],
+                         titles[static_cast<std::size_t>(index)]).copyTo(
+        canvas(cv::Rect(x, y, kBoundaryDebugPanelPixels,
+                        kBoundaryDebugPanelCellHeight)));
+    }
+
+    bool have_robot_position = false;
+    double robot_x = 0.0;
+    double robot_y = 0.0;
+    double robot_z = 0.0;
+    {
+      std::lock_guard<std::mutex> lock(sensor_origin_mutex_);
+      have_robot_position = have_sensor_origin_;
+      robot_x = latest_sensor_x_;
+      robot_y = latest_sensor_y_;
+      robot_z = latest_sensor_z_;
+    }
+    VoxelKey robot_key;
+    bool robot_inside_raster = false;
+    if (have_robot_position)
+    {
+      robot_key = map_->worldToKey(robot_x, robot_y, robot_z);
+      const std::int64_t robot_column =
+        static_cast<std::int64_t>(robot_key.x) - layer.minimum_x;
+      const std::int64_t robot_row =
+        static_cast<std::int64_t>(robot_key.y) - layer.minimum_y;
+      robot_inside_raster = robot_column >= 0 && robot_column < layer.columns &&
+        robot_row >= 0 && robot_row < layer.rows;
+      if (robot_inside_raster)
+      {
+        const int panel_x = std::max(0, std::min(
+          kBoundaryDebugPanelPixels - 1,
+          static_cast<int>((robot_column + 0.5) *
+            kBoundaryDebugPanelPixels / layer.columns)));
+        const int displayed_row = layer.rows - 1 - static_cast<int>(robot_row);
+        const int panel_y = std::max(0, std::min(
+          kBoundaryDebugPanelPixels - 1,
+          static_cast<int>((displayed_row + 0.5) *
+            kBoundaryDebugPanelPixels / layer.rows)));
+        for (int index = 0; index < 9; ++index)
+        {
+          const int grid_column = index % 3;
+          const int grid_row = index / 3;
+          const cv::Point marker(
+            grid_column *
+              (kBoundaryDebugPanelPixels + kBoundaryDebugPanelGap) + panel_x,
+            grid_row *
+              (kBoundaryDebugPanelCellHeight + kBoundaryDebugPanelGap) +
+              kBoundaryDebugPanelHeaderPixels + panel_y);
+          // A black outline plus white cross stays visible on every mask;
+          // the red center identifies it as the robot/sensor XY origin.
+          cv::drawMarker(canvas, marker, cv::Scalar(0, 0, 0),
+                         cv::MARKER_CROSS, 21, 5, cv::LINE_AA);
+          cv::drawMarker(canvas, marker, cv::Scalar(255, 255, 255),
+                         cv::MARKER_CROSS, 21, 2, cv::LINE_AA);
+          cv::circle(canvas, marker, 3, cv::Scalar(0, 0, 255), cv::FILLED,
+                     cv::LINE_AA);
+        }
+      }
+    }
+
+    const TerrainBoundaryDebugStatistics& stats = result.debug_statistics;
+    const std::size_t recovered = stats.first_decision_counts[
+      static_cast<std::size_t>(TerrainBoundaryDecisionReason::Recovered)];
+    std::ostringstream status;
+    status << "projected XY grid | terrain=" << stats.terrain_voxels
+           << " | recoverable static=" << stats.recoverable_static_voxels
+           << " | excluded dynamic/ignore=" << stats.excluded_voxels
+           << " | newly white cells=" << stats.opencv_newly_filled_cells
+           << " | proposed cells/voxels=" << stats.opencv_proposed_cells
+           << "/" << stats.opencv_proposed_voxels
+           << " | recovered=" << recovered;
+    cv::putText(canvas, status.str(), cv::Point(6, grid_height + 26),
+                cv::FONT_HERSHEY_SIMPLEX, 0.48,
+                cv::Scalar(225, 225, 225), 1, cv::LINE_AA);
+    std::ostringstream kernels;
+    kernels << "resolved cells: closing radius="
+            << stats.closing_radius_cells
+            << " height threshold="
+            << stats.maximum_height_difference_cells
+            << " | click any panel or use RViz /clicked_point for details";
+    cv::putText(canvas, kernels.str(), cv::Point(6, grid_height + 50),
+                cv::FONT_HERSHEY_SIMPLEX, 0.43,
+                cv::Scalar(205, 205, 205), 1, cv::LINE_AA);
+    cv::putText(canvas,
+      "decision cloud: gray=outside closed support | blue=no terrain reference | orange=height too high | green=recovered",
+      cv::Point(6, grid_height + 70), cv::FONT_HERSHEY_SIMPLEX, 0.35,
+      cv::Scalar(190, 190, 190), 1, cv::LINE_AA);
+    std::ostringstream robot_status;
+    if (!have_robot_position)
+    {
+      robot_status << "robot marker: pose unavailable";
+    }
+    else
+    {
+      robot_status << std::fixed << std::setprecision(2)
+                   << "robot/sensor origin xyz=(" << robot_x << ","
+                   << robot_y << "," << robot_z << ") key=("
+                   << robot_key.x << "," << robot_key.y << ","
+                   << robot_key.z << ") | XY marker "
+                   << (robot_inside_raster ? "shown on every panel" :
+                       "outside current raster");
+    }
+    cv::putText(canvas, robot_status.str(), cv::Point(6, grid_height + 92),
+                cv::FONT_HERSHEY_SIMPLEX, 0.40,
+                cv::Scalar(225, 225, 225), 1, cv::LINE_AA);
+    return canvas;
+  }
+
+  sensor_msgs::Image makeTerrainBoundaryDebugImage(
+    const cv::Mat& canvas, const ros::Time& stamp) const
+  {
+    sensor_msgs::Image image;
+    image.header.stamp = stamp;
+    image.header.frame_id = mapFrame();
+    image.height = static_cast<std::uint32_t>(canvas.rows);
+    image.width = static_cast<std::uint32_t>(canvas.cols);
+    image.encoding = "bgr8";
+    image.is_bigendian = false;
+    image.step = image.width * 3u;
+    image.data.resize(static_cast<std::size_t>(image.height) * image.step);
+    for (int row = 0; row < canvas.rows; ++row)
+    {
+      std::memcpy(image.data.data() + static_cast<std::size_t>(row) * image.step,
+                  canvas.ptr(row), image.step);
+    }
+    return image;
+  }
+
+  sensor_msgs::PointCloud2 makeTerrainBoundaryDebugCloud(
+    const std::vector<TerrainBoundaryDebugRecord>& records,
+    const ros::Time& stamp) const
+  {
+    sensor_msgs::PointCloud2 cloud;
+    cloud.header.stamp = stamp;
+    cloud.header.frame_id = mapFrame();
+    cloud.height = 1u;
+    cloud.is_dense = false;
+    sensor_msgs::PointCloud2Modifier modifier(cloud);
+    modifier.setPointCloud2Fields(
+      16,
+      "x", 1, sensor_msgs::PointField::FLOAT32,
+      "y", 1, sensor_msgs::PointField::FLOAT32,
+      "z", 1, sensor_msgs::PointField::FLOAT32,
+      "rgb", 1, sensor_msgs::PointField::FLOAT32,
+      "reason", 1, sensor_msgs::PointField::UINT32,
+      "failure_mask", 1, sensor_msgs::PointField::UINT32,
+      "original_label", 1, sensor_msgs::PointField::UINT32,
+      "proposed", 1, sensor_msgs::PointField::UINT8,
+      "reference_found", 1, sensor_msgs::PointField::UINT8,
+      "reference_x", 1, sensor_msgs::PointField::FLOAT32,
+      "reference_y", 1, sensor_msgs::PointField::FLOAT32,
+      "reference_z", 1, sensor_msgs::PointField::FLOAT32,
+      "reference_label", 1, sensor_msgs::PointField::UINT32,
+      "reference_distance_xy", 1, sensor_msgs::PointField::FLOAT32,
+      "height_difference", 1, sensor_msgs::PointField::FLOAT32,
+      "replacement_label", 1, sensor_msgs::PointField::UINT32);
+    modifier.resize(records.size());
+    sensor_msgs::PointCloud2Iterator<float> x(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> y(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> z(cloud, "z");
+    sensor_msgs::PointCloud2Iterator<float> rgb(cloud, "rgb");
+    sensor_msgs::PointCloud2Iterator<std::uint32_t> reason(cloud, "reason");
+    sensor_msgs::PointCloud2Iterator<std::uint32_t> failure_mask(
+      cloud, "failure_mask");
+    sensor_msgs::PointCloud2Iterator<std::uint32_t> original_label(
+      cloud, "original_label");
+    sensor_msgs::PointCloud2Iterator<std::uint8_t> proposed(cloud, "proposed");
+    sensor_msgs::PointCloud2Iterator<std::uint8_t> reference_found(
+      cloud, "reference_found");
+    sensor_msgs::PointCloud2Iterator<float> reference_x(cloud, "reference_x");
+    sensor_msgs::PointCloud2Iterator<float> reference_y(cloud, "reference_y");
+    sensor_msgs::PointCloud2Iterator<float> reference_z(cloud, "reference_z");
+    sensor_msgs::PointCloud2Iterator<std::uint32_t> reference_label(
+      cloud, "reference_label");
+    sensor_msgs::PointCloud2Iterator<float> reference_distance(
+      cloud, "reference_distance_xy");
+    sensor_msgs::PointCloud2Iterator<float> height_difference(
+      cloud, "height_difference");
+    sensor_msgs::PointCloud2Iterator<std::uint32_t> replacement_label(
+      cloud, "replacement_label");
+    for (const TerrainBoundaryDebugRecord& record : records)
+    {
+      const auto color = boundaryDebugReasonRgb(record.first_failure);
+      *x = static_cast<float>(record.x);
+      *y = static_cast<float>(record.y);
+      *z = static_cast<float>(record.z);
+      *rgb = packedRgbFloat(color[0], color[1], color[2]);
+      *reason = static_cast<std::uint32_t>(record.first_failure);
+      *failure_mask = record.failure_mask;
+      *original_label = record.original_label;
+      *proposed = record.proposed ? 1u : 0u;
+      *reference_found = record.reference_found ? 1u : 0u;
+      *reference_x = static_cast<float>(record.reference_x);
+      *reference_y = static_cast<float>(record.reference_y);
+      *reference_z = static_cast<float>(record.reference_z);
+      *reference_label = record.reference_label;
+      *reference_distance = static_cast<float>(record.reference_distance_xy);
+      *height_difference = static_cast<float>(record.height_difference);
+      *replacement_label = record.replacement_label;
+      ++x; ++y; ++z; ++rgb; ++reason; ++failure_mask; ++original_label;
+      ++proposed; ++reference_found; ++reference_x; ++reference_y; ++reference_z;
+      ++reference_label; ++reference_distance; ++height_difference;
+      ++replacement_label;
+    }
+    return cloud;
+  }
+
+  void logTerrainBoundaryDebugRecord(
+    const TerrainBoundaryDebugRecord& record, const std::string& source) const
+  {
+    ROS_INFO_STREAM(
+      "Terrain-boundary debug [" << source << "] key=(" << record.key.x
+      << "," << record.key.y << "," << record.key.z << ") xyz=("
+      << std::fixed << std::setprecision(3) << record.x << "," << record.y
+      << "," << record.z << ") decision="
+      << terrainBoundaryDecisionReasonName(record.first_failure)
+      << " failure_mask=0x" << std::hex << record.failure_mask << std::dec
+      << " | original_label=" << record.original_label
+      << " | morphology closed=" << record.closed_terrain
+      << " proposed=" << record.proposed
+      << " | reference_found=" << record.reference_found
+      << " reference_xyz=(" << record.reference_x << ","
+      << record.reference_y << "," << record.reference_z << ")"
+      << " reference_label=" << record.reference_label
+      << " distance_xy=" << record.reference_distance_xy
+      << " | height_difference=" << record.height_difference
+      << " <= " << terrain_boundary_filter_config_.maximum_height_difference
+      << " replacement=" << record.replacement_label);
+  }
+
+  void writeTerrainBoundaryDebugCsv(
+    const TerrainBoundaryFilterResult& result, const ros::Time& stamp)
+  {
+    if (!terrain_boundary_debug_csv_)
+    {
+      return;
+    }
+    terrain_boundary_debug_csv_ << std::setprecision(9);
+    for (const TerrainBoundaryDebugRecord& record : result.debug_records)
+    {
+      terrain_boundary_debug_csv_
+        << stamp.toSec() << ',' << record.key.x << ',' << record.key.y << ','
+        << record.key.z << ',' << record.x << ',' << record.y << ',' << record.z
+        << ',' << terrainBoundaryDecisionReasonName(record.first_failure) << ','
+        << record.failure_mask << ',' << record.original_label << ','
+        << record.closed_terrain << ',' << record.proposed << ','
+        << record.reference_found << ',' << record.reference_key.x << ','
+        << record.reference_key.y << ',' << record.reference_key.z << ','
+        << record.reference_x << ',' << record.reference_y << ','
+        << record.reference_z << ',' << record.reference_label << ','
+        << record.reference_distance_xy << ',' << record.height_difference
+        << ',' << record.replacement_label << '\n';
+    }
+    terrain_boundary_debug_csv_.flush();
+  }
+
+  void logTerrainBoundaryDebugStatistics(
+    const TerrainBoundaryFilterResult& result)
+  {
+    const TerrainBoundaryDebugStatistics& stats = result.debug_statistics;
+    std::ostringstream summary;
+    summary << "Terrain-boundary debug frame "
+            << terrain_boundary_debug_frame_count_
+            << ": terrain=" << stats.terrain_voxels
+            << ", recoverable_static=" << stats.recoverable_static_voxels
+            << ", excluded_dynamic_or_ignore=" << stats.excluded_voxels
+            << ", newly_white_cells=" << stats.opencv_newly_filled_cells
+            << ", proposed_cells/voxels=" << stats.opencv_proposed_cells
+            << '/' << stats.opencv_proposed_voxels
+            << ", reference_found=" << stats.reference_found_voxels;
+    for (std::size_t index = 0u;
+         index < stats.first_decision_counts.size(); ++index)
+    {
+      if (stats.first_decision_counts[index] == 0u)
+      {
+        continue;
+      }
+      summary << ", " << terrainBoundaryDecisionReasonName(
+        static_cast<TerrainBoundaryDecisionReason>(index)) << '='
+              << stats.first_decision_counts[index];
+    }
+    ROS_INFO_STREAM(summary.str());
+
+    if (terrain_boundary_debug_max_samples_per_reason_ == 0)
+    {
+      return;
+    }
+    std::array<int, kTerrainBoundaryDecisionReasonCount> samples{{}};
+    for (const TerrainBoundaryDebugRecord& record : result.debug_records)
+    {
+      const std::size_t index = static_cast<std::size_t>(record.first_failure);
+      if (index >= samples.size() ||
+          samples[index] >= terrain_boundary_debug_max_samples_per_reason_)
+      {
+        continue;
+      }
+      ++samples[index];
+      logTerrainBoundaryDebugRecord(record, "periodic sample");
+    }
+  }
+
+  void publishTerrainBoundaryDebug(
+    const TerrainBoundaryFilterResult& result, const ros::Time& stamp)
+  {
+    if (!terrain_boundary_debug_opencv_enabled_ &&
+        !terrain_boundary_debug_rviz_enabled_)
+    {
+      return;
+    }
+    ++terrain_boundary_debug_frame_count_;
+    {
+      std::lock_guard<std::mutex> lock(terrain_boundary_debug_mutex_);
+      latest_terrain_boundary_debug_records_ = result.debug_records;
+      latest_terrain_boundary_debug_layers_ = result.debug_layers;
+    }
+    if (terrain_boundary_debug_rviz_enabled_)
+    {
+      terrain_boundary_debug_decision_cloud_pub_.publish(
+        makeTerrainBoundaryDebugCloud(result.debug_records, stamp));
+    }
+    writeTerrainBoundaryDebugCsv(result, stamp);
+    if (terrain_boundary_debug_frame_count_ % static_cast<std::size_t>(
+          terrain_boundary_debug_statistics_interval_frames_) == 0u)
+    {
+      logTerrainBoundaryDebugStatistics(result);
+    }
+
+    // The simplified recovery works on one projected XY grid, not per-Z
+    // layers, so debug always displays index zero.
+    terrain_boundary_debug_selected_layer_index_ = 0;
+
+    try
+    {
+      if (terrain_boundary_debug_opencv_enabled_ &&
+          !terrain_boundary_opencv_window_initialized_)
+      {
+        cv::namedWindow(terrain_boundary_opencv_window_name_, cv::WINDOW_NORMAL);
+        terrain_boundary_opencv_window_initialized_ = true;
+        cv::setMouseCallback(
+          terrain_boundary_opencv_window_name_,
+          &SemanticVoxelMapNode::terrainBoundaryOpenCvMouseCallback, this);
+      }
+
+      const cv::Mat canvas = buildTerrainBoundaryDebugCanvas(
+        result, static_cast<std::size_t>(
+          terrain_boundary_debug_selected_layer_index_));
+      if (terrain_boundary_debug_rviz_enabled_)
+      {
+        terrain_boundary_debug_image_pub_.publish(
+          makeTerrainBoundaryDebugImage(canvas, stamp));
+      }
+      if (terrain_boundary_debug_opencv_enabled_)
+      {
+        cv::imshow(terrain_boundary_opencv_window_name_, canvas);
+        cv::waitKey(1);
+      }
+    }
+    catch (const cv::Exception& exception)
+    {
+      ROS_ERROR("Terrain-boundary debug visualization failed: %s; "
+                "disabling OpenCV and RViz debug output",
+                exception.what());
+      terrain_boundary_debug_opencv_enabled_ = false;
+      terrain_boundary_debug_rviz_enabled_ = false;
+    }
+  }
+
+  static void terrainBoundaryOpenCvMouseCallback(
+    const int event, const int x, const int y, const int, void* user_data)
+  {
+    if (event != cv::EVENT_LBUTTONDOWN || user_data == nullptr)
+    {
+      return;
+    }
+    static_cast<SemanticVoxelMapNode*>(user_data)->
+      handleTerrainBoundaryOpenCvClick(x, y);
+  }
+
+  void handleTerrainBoundaryOpenCvClick(const int x, const int y)
+  {
+    const int cell_width = kBoundaryDebugPanelPixels + kBoundaryDebugPanelGap;
+    const int cell_height =
+      kBoundaryDebugPanelCellHeight + kBoundaryDebugPanelGap;
+    const int grid_column = x / cell_width;
+    const int grid_row = y / cell_height;
+    if (grid_column < 0 || grid_column >= 3 ||
+        grid_row < 0 || grid_row >= 3)
+    {
+      return;
+    }
+    const int local_x = x - grid_column * cell_width;
+    const int local_y = y - grid_row * cell_height -
+      kBoundaryDebugPanelHeaderPixels;
+    if (local_x < 0 || local_x >= kBoundaryDebugPanelPixels ||
+        local_y < 0 || local_y >= kBoundaryDebugPanelPixels)
+    {
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(terrain_boundary_debug_mutex_);
+    if (latest_terrain_boundary_debug_layers_.empty())
+    {
+      return;
+    }
+    const std::size_t layer_index = std::min<std::size_t>(
+      static_cast<std::size_t>(std::max(
+        0, terrain_boundary_debug_selected_layer_index_)),
+      latest_terrain_boundary_debug_layers_.size() - 1u);
+    const TerrainBoundaryLayerDebug& layer =
+      latest_terrain_boundary_debug_layers_[layer_index];
+    const int raster_column = std::min(
+      layer.columns - 1, local_x * layer.columns / kBoundaryDebugPanelPixels);
+    const int displayed_row = std::min(
+      layer.rows - 1, local_y * layer.rows / kBoundaryDebugPanelPixels);
+    const int raster_row = layer.rows - 1 - displayed_row;
+    const std::int32_t selected_x = layer.minimum_x + raster_column;
+    const std::int32_t selected_y = layer.minimum_y + raster_row;
+    std::size_t matches = 0u;
+    for (const TerrainBoundaryDebugRecord& record :
+         latest_terrain_boundary_debug_records_)
+    {
+      if (record.key.x == selected_x && record.key.y == selected_y)
+      {
+        logTerrainBoundaryDebugRecord(record, "OpenCV click");
+        ++matches;
+      }
+    }
+    if (matches == 0u)
+    {
+      ROS_INFO("Terrain-boundary OpenCV click XY key=(%d,%d): "
+               "no recoverable static voxel",
+               selected_x, selected_y);
+      return;
+    }
+  }
+
+  void terrainBoundaryClickedPointCallback(
+    const geometry_msgs::PointStampedConstPtr& message)
+  {
+    tf2::Vector3 query(message->point.x, message->point.y, message->point.z);
+    const std::string source_frame = message->header.frame_id.empty() ?
+      mapFrame() : message->header.frame_id;
+    if (source_frame != mapFrame())
+    {
+      try
+      {
+        const geometry_msgs::TransformStamped transform =
+          tf_buffer_.lookupTransform(
+            mapFrame(), source_frame, message->header.stamp,
+            ros::Duration(transform_timeout_));
+        const tf2::Quaternion rotation(
+          transform.transform.rotation.x, transform.transform.rotation.y,
+          transform.transform.rotation.z, transform.transform.rotation.w);
+        const tf2::Vector3 translation(
+          transform.transform.translation.x, transform.transform.translation.y,
+          transform.transform.translation.z);
+        query = tf2::Transform(rotation, translation) * query;
+      }
+      catch (const tf2::TransformException& exception)
+      {
+        ROS_WARN("Terrain-boundary clicked-point TF error: %s", exception.what());
+        return;
+      }
+    }
+
+    std::lock_guard<std::mutex> lock(terrain_boundary_debug_mutex_);
+    const TerrainBoundaryDebugRecord* nearest = nullptr;
+    double nearest_distance_squared =
+      terrain_boundary_debug_clicked_point_radius_ *
+      terrain_boundary_debug_clicked_point_radius_;
+    for (const TerrainBoundaryDebugRecord& record :
+         latest_terrain_boundary_debug_records_)
+    {
+      const double dx = record.x - query.x();
+      const double dy = record.y - query.y();
+      const double dz = record.z - query.z();
+      const double distance_squared = dx * dx + dy * dy + dz * dz;
+      if (distance_squared <= nearest_distance_squared)
+      {
+        nearest_distance_squared = distance_squared;
+        nearest = &record;
+      }
+    }
+    if (nearest == nullptr)
+    {
+      ROS_INFO("Terrain-boundary clicked point (%.3f,%.3f,%.3f): "
+               "no recoverable static voxel within %.2f m",
+               query.x(), query.y(), query.z(),
+               terrain_boundary_debug_clicked_point_radius_);
+      return;
+    }
+    logTerrainBoundaryDebugRecord(*nearest, "RViz clicked_point");
+  }
+
+  void showTerrainBoundaryRecovery(
+    const std::vector<VoxelSnapshot>& before,
+    const std::vector<VoxelSnapshot>& after,
+    const std::vector<TerrainBoundaryRelabel>& relabeled)
+  {
+    if (!terrain_boundary_debug_opencv_enabled_)
+    {
+      return;
+    }
+    ++terrain_boundary_opencv_frame_count_;
+
+    try
+    {
+      if (before.empty())
+      {
+        cv::Mat empty_view(120, 720, CV_8UC3, cv::Scalar(24, 24, 24));
+        std::ostringstream empty_message;
+        empty_message << "Input frame " << terrain_boundary_opencv_frame_count_
+                      << ": no voxels in the current local map";
+        cv::putText(empty_view, empty_message.str(), cv::Point(28, 68),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.70,
+                    cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
+        if (!terrain_boundary_opencv_window_initialized_)
+        {
+          cv::namedWindow(terrain_boundary_opencv_window_name_, cv::WINDOW_NORMAL);
+          terrain_boundary_opencv_window_initialized_ = true;
+        }
+        cv::imshow(terrain_boundary_opencv_window_name_, empty_view);
+        cv::waitKey(1);
+        return;
+      }
+
+      std::int32_t min_x = before.front().key.x;
+      std::int32_t max_x = before.front().key.x;
+      std::int32_t min_y = before.front().key.y;
+      std::int32_t max_y = before.front().key.y;
+      for (const VoxelSnapshot& voxel : before)
+      {
+        min_x = std::min(min_x, voxel.key.x);
+        max_x = std::max(max_x, voxel.key.x);
+        min_y = std::min(min_y, voxel.key.y);
+        max_y = std::max(max_y, voxel.key.y);
+      }
+
+      const std::int64_t width64 =
+        static_cast<std::int64_t>(max_x) - min_x + 1;
+      const std::int64_t height64 =
+        static_cast<std::int64_t>(max_y) - min_y + 1;
+      constexpr std::int64_t kMaximumRasterCells = 16000000;
+      if (width64 <= 0 || height64 <= 0 ||
+          width64 > std::numeric_limits<int>::max() ||
+          height64 > std::numeric_limits<int>::max() ||
+          width64 > kMaximumRasterCells / height64)
+      {
+        ROS_ERROR_THROTTLE(
+          2.0, "Cannot draw terrain recovery raster with bounds %lld x %lld; "
+          "disabling the OpenCV window",
+          static_cast<long long>(width64), static_cast<long long>(height64));
+        terrain_boundary_debug_opencv_enabled_ = false;
+        return;
+      }
+
+      const int width = static_cast<int>(width64);
+      const int height = static_cast<int>(height64);
+      cv::Mat before_image(height, width, CV_8UC3, cv::Scalar(24, 24, 24));
+      cv::Mat after_image(height, width, CV_8UC3, cv::Scalar(24, 24, 24));
+      cv::Mat before_priority(height, width, CV_8UC1, cv::Scalar(0));
+      cv::Mat after_priority(height, width, CV_8UC1, cv::Scalar(0));
+
+      const auto draw_projection = [this, min_x, max_y](
+        const std::vector<VoxelSnapshot>& voxels, cv::Mat& image,
+        cv::Mat& priority)
+      {
+        for (const VoxelSnapshot& voxel : voxels)
+        {
+          const int column = static_cast<int>(
+            static_cast<std::int64_t>(voxel.key.x) - min_x);
+          const int row = static_cast<int>(
+            static_cast<std::int64_t>(max_y) - voxel.key.y);
+          std::uint8_t voxel_priority = 1u;
+          cv::Vec3b color(96u, 96u, 96u);
+          if (voxel.label == kInvalidSemanticLabel)
+          {
+            voxel_priority = 0u;
+            color = cv::Vec3b(48u, 48u, 48u);
+          }
+          else if (isTerrainBoundaryTerrainLabel(voxel.label))
+          {
+            voxel_priority = 2u;
+            color = cv::Vec3b(255u, 255u, 255u);
+          }
+          else if (isTerrainBoundaryRecoverableLabel(voxel.label))
+          {
+            voxel_priority = 3u;
+            color = cv::Vec3b(0u, 0u, 255u);
+          }
+          if (voxel_priority >= priority.at<std::uint8_t>(row, column))
+          {
+            priority.at<std::uint8_t>(row, column) = voxel_priority;
+            image.at<cv::Vec3b>(row, column) = color;
+          }
+        }
+      };
+      draw_projection(before, before_image, before_priority);
+      draw_projection(after, after_image, after_priority);
+
+      for (const TerrainBoundaryRelabel& recovered : relabeled)
+      {
+        const std::int64_t column64 =
+          static_cast<std::int64_t>(recovered.key.x) - min_x;
+        const std::int64_t row64 =
+          static_cast<std::int64_t>(max_y) - recovered.key.y;
+        if (column64 >= 0 && column64 < width64 &&
+            row64 >= 0 && row64 < height64)
+        {
+          after_image.at<cv::Vec3b>(static_cast<int>(row64),
+                                    static_cast<int>(column64)) =
+            cv::Vec3b(0u, 255u, 0u);
+        }
+      }
+
+      const std::size_t before_recoverable_static = static_cast<std::size_t>(
+        std::count_if(before.begin(), before.end(), [this](const VoxelSnapshot& voxel)
+        {
+          return isTerrainBoundaryRecoverableLabel(voxel.label);
+        }));
+      const std::size_t after_recoverable_static = static_cast<std::size_t>(
+        std::count_if(after.begin(), after.end(), [this](const VoxelSnapshot& voxel)
+        {
+          return isTerrainBoundaryRecoverableLabel(voxel.label);
+        }));
+
+      constexpr int kPanelPixels = 620;
+      const double scale = std::min(
+        static_cast<double>(kPanelPixels) / width,
+        static_cast<double>(kPanelPixels) / height);
+      const cv::Size raster_size(
+        std::max(1, static_cast<int>(std::lround(width * scale))),
+        std::max(1, static_cast<int>(std::lround(height * scale))));
+      cv::Mat before_raster;
+      cv::Mat after_raster;
+      cv::resize(before_image, before_raster, raster_size, 0.0, 0.0,
+                 cv::INTER_NEAREST);
+      cv::resize(after_image, after_raster, raster_size, 0.0, 0.0,
+                 cv::INTER_NEAREST);
+      cv::Mat before_panel(kPanelPixels, kPanelPixels, CV_8UC3,
+                           cv::Scalar(24, 24, 24));
+      cv::Mat after_panel(kPanelPixels, kPanelPixels, CV_8UC3,
+                          cv::Scalar(24, 24, 24));
+      const int raster_x = (kPanelPixels - raster_size.width) / 2;
+      const int raster_y = (kPanelPixels - raster_size.height) / 2;
+      before_raster.copyTo(before_panel(cv::Rect(
+        raster_x, raster_y, raster_size.width, raster_size.height)));
+      after_raster.copyTo(after_panel(cv::Rect(
+        raster_x, raster_y, raster_size.width, raster_size.height)));
+
+      constexpr int kHeaderHeight = 42;
+      constexpr int kFooterHeight = 54;
+      constexpr int kPanelGap = 12;
+      cv::Mat canvas(kPanelPixels + kHeaderHeight + kFooterHeight,
+                     kPanelPixels * 2 + kPanelGap, CV_8UC3,
+                     cv::Scalar(24, 24, 24));
+      before_panel.copyTo(canvas(cv::Rect(
+        0, kHeaderHeight, kPanelPixels, kPanelPixels)));
+      after_panel.copyTo(canvas(cv::Rect(
+        kPanelPixels + kPanelGap, kHeaderHeight,
+        kPanelPixels, kPanelPixels)));
+      cv::putText(canvas, "BEFORE: recoverable static = red", cv::Point(8, 27),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.52,
+                  cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+      cv::putText(canvas, "AFTER: recovered = green",
+                  cv::Point(kPanelPixels + kPanelGap + 8, 27),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.52,
+                  cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+      std::ostringstream status;
+      status << "Input frame: " << terrain_boundary_opencv_frame_count_
+             << " | 3D recoverable static voxels: "
+             << before_recoverable_static << " -> "
+             << after_recoverable_static
+             << " | recovered: " << relabeled.size();
+      cv::putText(canvas, status.str(),
+                  cv::Point(8, canvas.rows - 30), cv::FONT_HERSHEY_SIMPLEX,
+                  0.45, cv::Scalar(210, 210, 210), 1, cv::LINE_AA);
+      cv::putText(canvas,
+                  "white = YAML terrain | gray = other labels | X right, Y up",
+                  cv::Point(8, canvas.rows - 10), cv::FONT_HERSHEY_SIMPLEX,
+                  0.45, cv::Scalar(210, 210, 210), 1, cv::LINE_AA);
+
+      if (!terrain_boundary_opencv_window_initialized_)
+      {
+        cv::namedWindow(terrain_boundary_opencv_window_name_, cv::WINDOW_NORMAL);
+        terrain_boundary_opencv_window_initialized_ = true;
+      }
+      cv::imshow(terrain_boundary_opencv_window_name_, canvas);
+      cv::waitKey(1);
+    }
+    catch (const cv::Exception& exception)
+    {
+      ROS_ERROR("OpenCV terrain-recovery visualization failed: %s; "
+                "disabling the window", exception.what());
+      terrain_boundary_debug_opencv_enabled_ = false;
+    }
   }
 
   struct ScanVoxel
@@ -621,6 +1831,27 @@ private:
   std::vector<SemanticClass> loadSemanticClasses()
   {
     std::vector<SemanticClass> output;
+    if (shared_semantic_profile_.enabled)
+    {
+      output.reserve(shared_semantic_profile_.classes.size());
+      for (const SharedNavigationSemanticClass& shared_class :
+           shared_semantic_profile_.classes)
+      {
+        SemanticClass semantic_class;
+        semantic_class.label = shared_class.label;
+        semantic_class.name = shared_class.name;
+        semantic_class.red = shared_class.rgb[0];
+        semantic_class.green = shared_class.rgb[1];
+        semantic_class.blue = shared_class.rgb[2];
+        semantic_class.traversability_cost = shared_class.semantic_cost;
+        output.push_back(semantic_class);
+        ROS_INFO("Shared semantic class %s label=%u role=%s cost=%.2f",
+                 shared_class.name.c_str(), shared_class.label,
+                 shared_class.role.c_str(), shared_class.semantic_cost);
+      }
+      return output;
+    }
+
     XmlRpc::XmlRpcValue classes;
     if (!private_nh_.getParam("semantic_classes", classes))
     {
@@ -1195,8 +2426,17 @@ private:
     {
       boundary_filter_result = terrain_boundary_filter_->filter(
         voxels, map_->voxelSizeXY(), map_->voxelSizeZ());
+      if (commit_voxel_snapshot)
+      {
+        publishTerrainBoundaryDebug(boundary_filter_result, stamp);
+      }
       voxels = std::move(boundary_filter_result.voxels);
     }
+    // This assignment is the single publication cut-over. Every consumer
+    // below—FAR's voxel_cloud, localPlanner's projected cost cloud, semantic
+    // markers, and the global SemanticOctomap admission cloud—is derived from
+    // this same recovered snapshot. The persistent fusion map stays raw and
+    // is re-filtered on each acquisition so morphology cannot feed itself.
     const std::vector<TraversabilityColumnSnapshot> cost_columns =
       projectTraversabilityColumns(voxels);
     if (commit_voxel_snapshot && derived_height_obstacles > 0u)
@@ -1207,10 +2447,9 @@ private:
     if (commit_voxel_snapshot && !boundary_filter_result.relabeled.empty())
     {
       ROS_INFO_THROTTLE(
-        2.0, "Terrain-boundary cleanup reclassified %zu thin label-%u voxels "
-        "using neighboring terrain classes",
-        boundary_filter_result.relabeled.size(),
-        terrain_boundary_filter_config_.obstacle_label);
+        2.0, "Static-terrain morphology recovery reclassified %zu observed "
+        "static voxels using OpenCV closing and the relative-height gate",
+        boundary_filter_result.relabeled.size());
     }
     visualization_msgs::Marker semantic_marker;
     semantic_marker.header.frame_id = mapFrame();
@@ -1527,9 +2766,7 @@ private:
       const AdmissionPoint point = transform_admission_point(
         voxel.x, voxel.y, voxel.z, voxel.traversability_cost, voxel.label);
 
-      const LocalAdmissionDecision decision = classifyLocalAdmissionVoxel(
-        voxel.label, admission_exclude_dynamic_);
-      if (decision == LocalAdmissionDecision::RejectedDynamic)
+      if (admission_exclude_dynamic_ && isConfiguredDynamicLabel(voxel.label))
       {
         result.rejected_dynamic.push_back(point);
         continue;
@@ -1749,6 +2986,12 @@ private:
       have_voxel_cloud_snapshot_ = false;
       voxel_cloud_snapshot_ = sensor_msgs::PointCloud2();
     }
+    {
+      std::lock_guard<std::mutex> debug_lock(terrain_boundary_debug_mutex_);
+      latest_terrain_boundary_debug_records_.clear();
+      latest_terrain_boundary_debug_layers_.clear();
+      terrain_boundary_debug_selected_layer_index_ = 0;
+    }
     if (clear_reference && use_initial_pose_reference_)
     {
       have_initial_reference_ = false;
@@ -1785,6 +3028,7 @@ private:
   std::unique_ptr<ObstacleRevocationTracker> obstacle_revocation_tracker_;
   std::unique_ptr<TerrainBoundaryFilter> terrain_boundary_filter_;
   ros::Subscriber cloud_sub_;
+  ros::Subscriber terrain_boundary_debug_clicked_point_sub_;
   ros::Publisher semantic_marker_pub_;
   ros::Publisher cost_marker_pub_;
   ros::Publisher cloud_pub_;
@@ -1800,6 +3044,8 @@ private:
   ros::Publisher revocation_candidates_pub_;
   ros::Publisher revoked_free_pub_;
   ros::Publisher revoked_reclassified_pub_;
+  ros::Publisher terrain_boundary_debug_decision_cloud_pub_;
+  ros::Publisher terrain_boundary_debug_image_pub_;
   ros::ServiceServer reset_service_;
   ros::ServiceServer save_service_;
   ros::ServiceServer load_service_;
@@ -1828,6 +3074,25 @@ private:
   int ssmi_revocation_ray_point_stride_ = 2;
   TerrainHeightCostConfig terrain_height_cost_config_;
   TerrainBoundaryFilterConfig terrain_boundary_filter_config_;
+  SharedNavigationSemanticProfile shared_semantic_profile_;
+  bool terrain_boundary_debug_opencv_enabled_ = false;
+  bool terrain_boundary_debug_rviz_enabled_ = false;
+  int terrain_boundary_debug_statistics_interval_frames_ = 10;
+  int terrain_boundary_debug_max_samples_per_reason_ = 1;
+  double terrain_boundary_debug_clicked_point_radius_ = 0.20;
+  std::string terrain_boundary_debug_clicked_point_topic_ = "/clicked_point";
+  std::string terrain_boundary_debug_csv_path_;
+  std::ofstream terrain_boundary_debug_csv_;
+  std::size_t terrain_boundary_debug_frame_count_ = 0u;
+  int terrain_boundary_debug_selected_layer_index_ = 0;
+  std::mutex terrain_boundary_debug_mutex_;
+  std::vector<TerrainBoundaryDebugRecord>
+    latest_terrain_boundary_debug_records_;
+  std::vector<TerrainBoundaryLayerDebug> latest_terrain_boundary_debug_layers_;
+  bool terrain_boundary_opencv_window_initialized_ = false;
+  std::size_t terrain_boundary_opencv_frame_count_ = 0u;
+  const std::string terrain_boundary_opencv_window_name_ =
+    "Terrain boundary recovery debug";
   float default_confidence_ = 1.0f;
   float ssmi_obstacle_traversability_threshold_ = 0.75f;
   double max_range_ = 15.0;

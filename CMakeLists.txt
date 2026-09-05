@@ -16,6 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_sensor_msgs
   visualization_msgs
 )
+find_package(OpenCV REQUIRED COMPONENTS core highgui imgproc)
 
 catkin_package(
   INCLUDE_DIRS include
@@ -32,11 +33,13 @@ catkin_package(
     tf2_ros
     tf2_sensor_msgs
     visualization_msgs
+  DEPENDS OpenCV
 )
 
 include_directories(
   include
   ${catkin_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
 )
 
 add_library(semantic_voxel_map
@@ -47,7 +50,7 @@ add_library(semantic_voxel_map
   src/ssmi_semantic_encoding.cpp
   src/terrain_boundary_filter.cpp
 )
-target_link_libraries(semantic_voxel_map ${catkin_LIBRARIES})
+target_link_libraries(semantic_voxel_map ${catkin_LIBRARIES} ${OpenCV_LIBRARIES})
 add_dependencies(semantic_voxel_map ${catkin_EXPORTED_TARGETS})
 
 add_executable(local_3d_semantic_voxel_map_node
@@ -56,6 +59,7 @@ add_executable(local_3d_semantic_voxel_map_node
 target_link_libraries(local_3d_semantic_voxel_map_node
   semantic_voxel_map
   ${catkin_LIBRARIES}
+  ${OpenCV_LIBRARIES}
 )
 add_dependencies(local_3d_semantic_voxel_map_node ${catkin_EXPORTED_TARGETS})
 

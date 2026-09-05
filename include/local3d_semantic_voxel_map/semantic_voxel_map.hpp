@@ -130,6 +130,7 @@ struct TraversabilityColumnSnapshot
 struct TerrainHeightCostConfig
 {
   bool enabled = false;
+  std::vector<std::uint32_t> terrain_labels{0u, 1u, 9u};
   double height_difference_threshold = 0.15;
   double neighborhood_radius = 0.20;
   double comparison_epsilon = 1e-6;
