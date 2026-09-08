@@ -81,6 +81,11 @@ target = semantic_cost_weight * semantic_expected_cost
 The stored cost uses an asymmetric exponential moving average. `cost_rise_alpha`
 is deliberately larger than `cost_fall_alpha`, so a dangerous observation takes
 effect quickly while declaring a voxel safe again requires repeated evidence.
+With a shared schema, `geometry_only` and unconfigured labels are normalized to
+an unclassified voxel. A real measured cost is used by fusion; if both semantic
+and measured cost are absent, the finite XYZ return is still retained with
+`missing_traversability_cost` (default 1.0), while the measured-cost field stays
+NaN so its provenance is not lost.
 
 For the simulation profile, which has no traversability field, the published
 snapshot additionally builds a terrain height neighborhood from labels 0, 1 and
@@ -134,15 +139,18 @@ Published topics:
   `~rejected_unknown`, `~rejected_rear`, and `~revoked_reclassified` remain
   empty in the current policy.
 
-Insertion remains an immediate 0.10 m local snapshot with no multi-frame
-stability gate, 0.40 m re-voxelization, or rear corridor. A separate 0.10 m
-mirror remembers only obstacle-like endpoints already sent to SSMI. Mere
+Insertion remains an immediate local snapshot with no multi-frame stability
+gate or rear corridor. A separate configurable-resolution mirror (0.40 m in
+the five-class profile, aligned with SemanticOctomap) remembers only
+obstacle-like endpoints already sent to SSMI. Mere
 absence, rolling-window pruning, and dynamic occlusion never revoke an endpoint.
-Five distinct frames over at least 0.5 s of confident low-cost terrain or
-configured raw-depth ray traversal are required. Simulation enables ray
+Five distinct frames over at least 0.5 s of confident low-cost terrain,
+fresh measured low-cost unclassified geometry, or configured raw-depth ray
+traversal are required. Missing traversability never counts as free evidence.
+Simulation enables ray
 evidence to remove trails from movers mislabeled as static; the processed
-`/grids_points` profile disables ray evidence and accepts only direct semantic/
-traversability contradiction.
+`/grids_points` profile disables ray evidence and accepts direct semantic or
+measured-geometry contradiction.
 
 All map clouds, including the direct SSMI cloud, use the last successfully
 processed input acquisition stamp.

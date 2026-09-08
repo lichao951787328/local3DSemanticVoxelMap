@@ -50,6 +50,8 @@ SemanticVoxelMap::SemanticVoxelMap(const SemanticVoxelMapConfig& config)
     config_.voxel_size_z = config_.voxel_size;
   }
   config_.unknown_cost = clampUnit(config_.unknown_cost);
+  config_.missing_traversability_cost =
+    clampUnit(config_.missing_traversability_cost);
   config_.semantic_cost_weight = clampUnit(config_.semantic_cost_weight);
   config_.semantic_risk_alpha = clampUnit(config_.semantic_risk_alpha);
   config_.cost_rise_alpha = clampUnit(config_.cost_rise_alpha);
@@ -91,7 +93,8 @@ void SemanticVoxelMap::integrate(const VoxelKey& key,
 {
   const bool has_semantic = observation.label != kInvalidSemanticLabel &&
                             observation.semantic_confidence > 0.0f;
-  if (!has_semantic && !observation.has_traversability_cost)
+  if (!has_semantic && !observation.has_traversability_cost &&
+      !observation.retain_unclassified)
   {
     return;
   }
@@ -722,7 +725,7 @@ float SemanticVoxelMap::combinedTraversabilityCost(const SemanticVoxel& voxel) c
   if (!has_semantic)
   {
     return voxel.has_measured_traversability ?
-      voxel.measured_traversability_cost : config_.unknown_cost;
+      voxel.measured_traversability_cost : config_.missing_traversability_cost;
   }
   if (!voxel.has_measured_traversability)
   {

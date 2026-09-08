@@ -121,6 +121,11 @@ bool ObstacleRevocationTracker::isDynamic(const std::uint32_t label) const
   return dynamic_labels_.count(label) != 0u;
 }
 
+bool ObstacleRevocationTracker::isUnclassified(const std::uint32_t label) const
+{
+  return label == kInvalidSemanticLabel;
+}
+
 bool ObstacleRevocationTracker::isTerrain(const std::uint32_t label) const
 {
   return terrain_labels_.count(label) != 0u;
@@ -241,8 +246,23 @@ ObstacleRevocationResult ObstacleRevocationTracker::update(
       state.free_terrain = true;
       state.free_evidence_weight = std::max(
         state.free_evidence_weight,
-        static_cast<double>(std::max(0.0f,
-          std::min(1.0f, voxel.semantic_confidence))));
+          static_cast<double>(std::max(0.0f,
+            std::min(1.0f, voxel.semantic_confidence))));
+    }
+    else if (config_.allow_unclassified_geometry_free_evidence &&
+             isUnclassified(voxel.label) &&
+             voxel.last_observed == stamp &&
+             voxel.has_measured_traversability &&
+             std::isfinite(voxel.measured_traversability_cost) &&
+             voxel.measured_traversability_cost <=
+               config_.free_max_traversability)
+    {
+      // Geometry-only obstacles have no semantic confidence to weight. A
+      // fresh measured low cost is nevertheless positive evidence; the common
+      // multi-frame/duration gates below prevent a single noisy sample from
+      // deleting a persistent global obstacle.
+      state.free_terrain = true;
+      state.free_evidence_weight = 1.0;
     }
   }
 

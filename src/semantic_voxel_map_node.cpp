@@ -3,6 +3,7 @@
 #include "local3d_semantic_voxel_map/obstacle_revocation.hpp"
 #include "local3d_semantic_voxel_map/ssmi_semantic_encoding.hpp"
 #include "local3d_semantic_voxel_map/terrain_boundary_filter.hpp"
+#include "local3d_semantic_voxel_map/two_layer_angular_clearing.hpp"
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
@@ -17,6 +18,7 @@
 #include <std_srvs/Empty.h>
 #include <std_srvs/Trigger.h>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2/LinearMath/Vector3.h>
 #include <tf2_ros/static_transform_broadcaster.h>
@@ -249,6 +251,7 @@ struct SharedNavigationSemanticClass
   std::string role;
   std::array<std::uint8_t, 3> rgb{{127u, 127u, 127u}};
   float semantic_cost = 0.5f;
+  bool geometry_only = false;
 };
 
 struct SharedNavigationSemanticProfile
@@ -393,6 +396,11 @@ SharedNavigationSemanticProfile loadSharedNavigationSemanticProfile(
       throw std::runtime_error(context + "/semantic_cost must be in [0, 1]");
     }
     semantic_class.semantic_cost = static_cast<float>(semantic_cost);
+    if (item.hasMember("geometry_only"))
+    {
+      semantic_class.geometry_only = xmlBool(
+        item["geometry_only"], context + "/geometry_only");
+    }
     profile.classes.push_back(semantic_class);
   }
   profile.enabled = true;
@@ -418,6 +426,8 @@ public:
     private_nh_.param("max_voxels", max_voxels, 500000);
     map_config.max_voxels = max_voxels <= 0 ? 0u : static_cast<std::size_t>(max_voxels);
     private_nh_.param("unknown_cost", map_config.unknown_cost, 0.5f);
+    private_nh_.param("missing_traversability_cost",
+                      map_config.missing_traversability_cost, 1.0f);
     private_nh_.param("semantic_cost_weight", map_config.semantic_cost_weight, 0.8f);
     private_nh_.param("semantic_risk_alpha", map_config.semantic_risk_alpha, 1.0f);
     private_nh_.param("cost_rise_alpha", map_config.cost_rise_alpha, 0.65f);
@@ -514,6 +524,9 @@ public:
       ssmi_obstacle_traversability_threshold_;
     private_nh_.param("ssmi_revocation_minimum_semantic_confidence",
                       revocation_config.minimum_semantic_confidence, 0.60f);
+    private_nh_.param(
+      "ssmi_revocation_allow_unclassified_geometry_free_evidence",
+      revocation_config.allow_unclassified_geometry_free_evidence, true);
     private_nh_.param("ssmi_revocation_ray_endpoint_margin",
                       revocation_config.ray_endpoint_margin, 0.20);
     revocation_config.terrain_labels = loadLabelList(
@@ -706,6 +719,16 @@ public:
     private_nh_.param("local_box_max_y", local_box_max_y_, 12.0);
     private_nh_.param("local_box_min_z", local_box_min_z_, -2.0);
     private_nh_.param("local_box_max_z", local_box_max_z_, 4.0);
+    private_nh_.param("two_layer_angular_clearing_enabled",
+                      two_layer_angular_clearing_enabled_, false);
+    private_nh_.param<std::string>(
+      "two_layer_angular_clearing_topic",
+      two_layer_angular_clearing_topic_,
+      "/local_3d_semantic_voxel_map/two_layer_clearing_rays");
+    private_nh_.param("two_layer_angular_resolution_deg",
+                      two_layer_angular_resolution_deg_, 5.0);
+    private_nh_.param("two_layer_octomap_resolution",
+                      two_layer_octomap_resolution_, 0.40);
     private_nh_.param("robot_body_exclusion_enabled",
                       robot_body_exclusion_enabled_, false);
     private_nh_.param("robot_body_exclusion_min_x",
@@ -757,6 +780,26 @@ public:
     {
       ROS_WARN("Both local_box_enabled and local_radius are set; the local box "
                "takes precedence");
+    }
+    if (two_layer_angular_clearing_enabled_ && !local_box_enabled_)
+    {
+      throw std::runtime_error(
+        "~two_layer_angular_clearing_enabled requires ~local_box_enabled");
+    }
+    if (!std::isfinite(two_layer_angular_resolution_deg_) ||
+        two_layer_angular_resolution_deg_ <= 0.0 ||
+        two_layer_angular_resolution_deg_ > 360.0 ||
+        std::abs(360.0 / two_layer_angular_resolution_deg_ -
+                 std::round(360.0 / two_layer_angular_resolution_deg_)) > 1e-9)
+    {
+      throw std::runtime_error(
+        "~two_layer_angular_resolution_deg must divide 360 exactly");
+    }
+    if (!std::isfinite(two_layer_octomap_resolution_) ||
+        two_layer_octomap_resolution_ <= 0.0)
+    {
+      throw std::runtime_error(
+        "~two_layer_octomap_resolution must be positive");
     }
     if (robot_body_exclusion_enabled_ &&
         (robot_body_exclusion_min_x_ >= robot_body_exclusion_max_x_ ||
@@ -827,6 +870,11 @@ public:
       "revoked_free", 1, true);
     revoked_reclassified_pub_ = private_nh_.advertise<sensor_msgs::PointCloud2>(
       "revoked_reclassified", 1, true);
+    if (two_layer_angular_clearing_enabled_)
+    {
+      two_layer_clearing_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(
+        two_layer_angular_clearing_topic_, 1, true);
+    }
     if (terrain_boundary_debug_rviz_enabled_)
     {
       terrain_boundary_debug_decision_cloud_pub_ =
@@ -894,6 +942,11 @@ public:
                local_box_min_z_, local_box_max_z_,
                max_range_ > 0.0 ? std::to_string(max_range_).c_str() : "disabled");
     }
+    ROS_INFO("Two-layer angular clearing publisher: %s, topic=%s, "
+             "layers=2, octomap_resolution=%.3f m, angular_resolution=%.3f deg",
+             two_layer_angular_clearing_enabled_ ? "enabled" : "disabled",
+             two_layer_angular_clearing_topic_.c_str(),
+             two_layer_octomap_resolution_, two_layer_angular_resolution_deg_);
     if (robot_body_exclusion_enabled_)
     {
       ROS_INFO("Robot body input exclusion in cloud frame: "
@@ -1013,6 +1066,28 @@ private:
       {
         return semantic_class.label == label &&
                semantic_class.role == "dynamic_obstacle";
+      });
+  }
+
+  bool isConfiguredGeometryOnlyLabel(const std::uint32_t label) const
+  {
+    return std::any_of(
+      shared_semantic_profile_.classes.begin(),
+      shared_semantic_profile_.classes.end(),
+      [label](const SharedNavigationSemanticClass& semantic_class)
+      {
+        return semantic_class.label == label && semantic_class.geometry_only;
+      });
+  }
+
+  bool isConfiguredSemanticLabel(const std::uint32_t label) const
+  {
+    return std::any_of(
+      shared_semantic_profile_.classes.begin(),
+      shared_semantic_profile_.classes.end(),
+      [label](const SharedNavigationSemanticClass& semantic_class)
+      {
+        return semantic_class.label == label;
       });
   }
 
@@ -1826,6 +1901,7 @@ private:
     float semantic_weight = 0.0f;
     float cost_sum = 0.0f;
     float cost_weight = 0.0f;
+    bool retain_unclassified = false;
   };
 
   std::vector<SemanticClass> loadSemanticClasses()
@@ -2113,6 +2189,9 @@ private:
         static_cast<std::size_t>(point_stride_);
     scan_voxels.reserve(sampled_capacity / 2u + 1u);
     std::unordered_set<VoxelKey, VoxelKeyHash> ray_free_evidence;
+    std::vector<TwoLayerClearingPoint> two_layer_current_points;
+    if (two_layer_angular_clearing_enabled_)
+      two_layer_current_points.reserve(sampled_capacity);
     std::size_t sampled_points = 0u;
     std::size_t valid_points = 0u;
     std::size_t robot_body_rejected_points = 0u;
@@ -2168,6 +2247,16 @@ private:
         return true;
       }
 
+      // Preserve every current-acquisition return before semantic admission.
+      // Dynamic, unknown, and geometry-only points must all be able to stop a
+      // horizontal clearing ray even when they are excluded from the global
+      // occupied cloud later in this callback.
+      if (two_layer_angular_clearing_enabled_)
+      {
+        two_layer_current_points.push_back(
+          TwoLayerClearingPoint{sensor_x, sensor_y, z});
+      }
+
       if (obstacle_revocation_tracker_ &&
           ssmi_revocation_ray_evidence_enabled_ &&
           sampled_points %
@@ -2191,6 +2280,16 @@ private:
         {
           label = remapped->second;
         }
+        if (shared_semantic_profile_.enabled &&
+            (!isConfiguredSemanticLabel(label) ||
+             isConfiguredGeometryOnlyLabel(label)))
+        {
+          // Geometry-only (five-class label 0) and unconfigured labels are not
+          // semantic evidence. Normalize both to the same representation as a
+          // missing label while retaining the finite spatial return.
+          valid_semantic = false;
+          label = kInvalidSemanticLabel;
+        }
       }
 
       double confidence_value = default_confidence_;
@@ -2204,13 +2303,10 @@ private:
       double point_cost = 0.0;
       const bool valid_cost = cost.valid && readNumber(point, cost, point_cost) &&
                               std::isfinite(point_cost);
-      if ((!valid_semantic || point_confidence <= 0.0f) && !valid_cost)
-      {
-        return true;
-      }
-
       ++valid_points;
       ScanVoxel& aggregated = scan_voxels[map_->worldToKey(x, y, z)];
+      aggregated.retain_unclassified = aggregated.retain_unclassified ||
+        ((!valid_semantic || point_confidence <= 0.0f) && !valid_cost);
       if (valid_semantic && point_confidence > 0.0f)
       {
         aggregated.label_weights[label] += point_confidence;
@@ -2284,6 +2380,7 @@ private:
           winning->second / std::max(1e-6f, item.second.semantic_weight));
       }
       observation.has_traversability_cost = item.second.cost_weight > 0.0f;
+      observation.retain_unclassified = item.second.retain_unclassified;
       if (observation.has_traversability_cost)
       {
         observation.traversability_cost = item.second.cost_sum / item.second.cost_weight;
@@ -2296,6 +2393,36 @@ private:
     // domain: t(current frame) - t(last frame that hit this voxel).
     const std::size_t temporally_removed = map_->prune(message->header.stamp);
     const tf2::Quaternion sensor_rotation = sensor_to_map.getRotation().normalized();
+    double clearing_roll = 0.0;
+    double clearing_pitch = 0.0;
+    double clearing_yaw = 0.0;
+    tf2::Matrix3x3(sensor_rotation).getRPY(
+      clearing_roll, clearing_pitch, clearing_yaw);
+    (void)clearing_roll;
+    (void)clearing_pitch;
+    const ros::WallTime two_layer_start = ros::WallTime::now();
+    if (two_layer_angular_clearing_enabled_)
+    {
+      TwoLayerClearingConfig clearing_config;
+      clearing_config.octomap_resolution = two_layer_octomap_resolution_;
+      clearing_config.angular_resolution_deg =
+        two_layer_angular_resolution_deg_;
+      clearing_config.local_grid_resolution = map_->voxelSizeXY();
+      clearing_config.local_box_min_x = local_box_min_x_;
+      clearing_config.local_box_max_x = local_box_max_x_;
+      clearing_config.local_box_min_y = local_box_min_y_;
+      clearing_config.local_box_max_y = local_box_max_y_;
+      latest_two_layer_clearing_result_ =
+        generateTwoLayerAngularClearingRays(
+          two_layer_current_points, origin_x, origin_y, clearing_yaw,
+          clearing_config);
+    }
+    else
+    {
+      latest_two_layer_clearing_result_ = TwoLayerClearingResult();
+    }
+    const double two_layer_generation_ms =
+      (ros::WallTime::now() - two_layer_start).toSec() * 1000.0;
     if (local_box_enabled_)
     {
       map_->pruneOutsideBox(
@@ -2361,6 +2488,11 @@ private:
       std::min(timing_source_to_publish_min_ms_, source_to_publish_ms);
     timing_source_to_publish_max_ms_ =
       std::max(timing_source_to_publish_max_ms_, source_to_publish_ms);
+    timing_two_layer_sum_ms_ += two_layer_generation_ms;
+    timing_two_layer_min_ms_ =
+      std::min(timing_two_layer_min_ms_, two_layer_generation_ms);
+    timing_two_layer_max_ms_ =
+      std::max(timing_two_layer_max_ms_, two_layer_generation_ms);
     if (timing_report_frames_ > 0 &&
         timing_frame_count_ >= static_cast<std::size_t>(timing_report_frames_))
     {
@@ -2369,19 +2501,27 @@ private:
         "map_update avg/min/max=%.2f/%.2f/%.2f ms; "
         "postprocess_publish avg/min/max=%.2f/%.2f/%.2f ms; "
         "callback_total avg/min/max=%.2f/%.2f/%.2f ms; "
+        "two_layer_clear avg/min/max=%.3f/%.3f/%.3f ms; "
         "source_to_publish avg/min/max=%.2f/%.2f/%.2f ms; "
         "latest sampled=%zu/%zu, valid=%zu, scan_voxels=%zu, "
-        "body_rejected=%zu, expired=%zu, map_voxels=%zu",
+        "body_rejected=%zu, expired=%zu, map_voxels=%zu, "
+        "clear_rays=%zu (hit=%zu/no_hit=%zu), clear_cells=%zu",
         timing_frame_count_, timing_elapsed_sum_ms_ / timing_frame_count_,
         timing_elapsed_min_ms_, timing_elapsed_max_ms_,
         timing_postprocess_sum_ms_ / timing_frame_count_,
         timing_postprocess_min_ms_, timing_postprocess_max_ms_,
         timing_callback_total_sum_ms_ / timing_frame_count_,
         timing_callback_total_min_ms_, timing_callback_total_max_ms_,
+        timing_two_layer_sum_ms_ / timing_frame_count_,
+        timing_two_layer_min_ms_, timing_two_layer_max_ms_,
         timing_source_to_publish_sum_ms_ / timing_frame_count_,
         timing_source_to_publish_min_ms_, timing_source_to_publish_max_ms_,
         sampled_points, point_count, valid_points, scan_voxels.size(),
-        robot_body_rejected_points, temporally_removed, map_->size());
+        robot_body_rejected_points, temporally_removed, map_->size(),
+        latest_two_layer_clearing_result_.rays.size(),
+        latest_two_layer_clearing_result_.hit_rays,
+        latest_two_layer_clearing_result_.no_hit_rays,
+        latest_two_layer_clearing_result_.visited_local_cells);
       timing_frame_count_ = 0u;
       timing_elapsed_sum_ms_ = 0.0;
       timing_elapsed_min_ms_ = std::numeric_limits<double>::max();
@@ -2392,6 +2532,9 @@ private:
       timing_callback_total_sum_ms_ = 0.0;
       timing_callback_total_min_ms_ = std::numeric_limits<double>::max();
       timing_callback_total_max_ms_ = 0.0;
+      timing_two_layer_sum_ms_ = 0.0;
+      timing_two_layer_min_ms_ = std::numeric_limits<double>::max();
+      timing_two_layer_max_ms_ = 0.0;
       timing_source_to_publish_sum_ms_ = 0.0;
       timing_source_to_publish_min_ms_ = std::numeric_limits<double>::max();
       timing_source_to_publish_max_ms_ =
@@ -2410,11 +2553,76 @@ private:
     publish(latest_processed_frame_stamp_, false);
   }
 
+  sensor_msgs::PointCloud2 makeTwoLayerClearingCloud(
+    const TwoLayerClearingResult& result, const ros::Time& stamp) const
+  {
+    sensor_msgs::PointCloud2 cloud;
+    cloud.header.frame_id = mapFrame();
+    cloud.header.stamp = stamp;
+    cloud.height = 1u;
+    cloud.is_dense = true;
+    sensor_msgs::PointCloud2Modifier modifier(cloud);
+    modifier.setPointCloud2Fields(
+      9,
+      "x", 1, sensor_msgs::PointField::FLOAT32,
+      "y", 1, sensor_msgs::PointField::FLOAT32,
+      "z", 1, sensor_msgs::PointField::FLOAT32,
+      "origin_x", 1, sensor_msgs::PointField::FLOAT32,
+      "origin_y", 1, sensor_msgs::PointField::FLOAT32,
+      "origin_z", 1, sensor_msgs::PointField::FLOAT32,
+      "hit", 1, sensor_msgs::PointField::UINT8,
+      "layer", 1, sensor_msgs::PointField::UINT8,
+      "angle_bin", 1, sensor_msgs::PointField::UINT16);
+    modifier.resize(result.rays.size());
+
+    sensor_msgs::PointCloud2Iterator<float> x(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> y(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> z(cloud, "z");
+    sensor_msgs::PointCloud2Iterator<float> origin_x(cloud, "origin_x");
+    sensor_msgs::PointCloud2Iterator<float> origin_y(cloud, "origin_y");
+    sensor_msgs::PointCloud2Iterator<float> origin_z(cloud, "origin_z");
+    sensor_msgs::PointCloud2Iterator<std::uint8_t> hit(cloud, "hit");
+    sensor_msgs::PointCloud2Iterator<std::uint8_t> layer(cloud, "layer");
+    sensor_msgs::PointCloud2Iterator<std::uint16_t> angle_bin(
+      cloud, "angle_bin");
+    for (const TwoLayerClearingRay& ray : result.rays)
+    {
+      *x = static_cast<float>(ray.end_x);
+      *y = static_cast<float>(ray.end_y);
+      *z = static_cast<float>(ray.end_z);
+      *origin_x = static_cast<float>(ray.origin_x);
+      *origin_y = static_cast<float>(ray.origin_y);
+      *origin_z = static_cast<float>(ray.origin_z);
+      *hit = ray.hit ? 1u : 0u;
+      *layer = ray.layer;
+      *angle_bin = ray.angle_bin;
+      ++x;
+      ++y;
+      ++z;
+      ++origin_x;
+      ++origin_y;
+      ++origin_z;
+      ++hit;
+      ++layer;
+      ++angle_bin;
+    }
+    return cloud;
+  }
+
   void publish(const ros::Time& stamp, const bool commit_voxel_snapshot)
   {
     if (use_initial_pose_reference_ && !have_initial_reference_)
     {
       return;
+    }
+
+    // Publish the miss-only evidence before the occupied admission snapshot.
+    // Both messages keep the original acquisition stamp. The timer may repeat
+    // them, and the global consumer therefore also deduplicates by stamp.
+    if (two_layer_angular_clearing_enabled_)
+    {
+      two_layer_clearing_pub_.publish(makeTwoLayerClearingCloud(
+        latest_two_layer_clearing_result_, stamp));
     }
 
     std::vector<VoxelSnapshot> voxels = map_->snapshot();
@@ -2976,6 +3184,7 @@ private:
     latest_admission_frame_.clear();
     latest_processed_frame_stamp_ = ros::Time();
     pending_ray_free_evidence_.clear();
+    latest_two_layer_clearing_result_ = TwoLayerClearingResult();
     if (clear_reference && obstacle_revocation_tracker_)
     {
       // SSMI also starts a new mapping session after a rosbag time rewind.
@@ -3044,6 +3253,7 @@ private:
   ros::Publisher revocation_candidates_pub_;
   ros::Publisher revoked_free_pub_;
   ros::Publisher revoked_reclassified_pub_;
+  ros::Publisher two_layer_clearing_pub_;
   ros::Publisher terrain_boundary_debug_decision_cloud_pub_;
   ros::Publisher terrain_boundary_debug_image_pub_;
   ros::ServiceServer reset_service_;
@@ -3061,6 +3271,8 @@ private:
   std::string local_cost_frame_ = "wuba_base";
   std::string admission_output_frame_;
   std::string ssmi_admitted_topic_ = "/semantic_pcl/global_admitted";
+  std::string two_layer_angular_clearing_topic_ =
+    "/local_3d_semantic_voxel_map/two_layer_clearing_rays";
   std::string latest_admission_frame_;
   std::string input_layout_ = "image";
   std::unordered_map<std::uint32_t, std::uint32_t> semantic_label_remap_;
@@ -3071,6 +3283,7 @@ private:
   bool publish_ssmi_admitted_cloud_ = true;
   bool enable_ssmi_obstacle_revocation_ = true;
   bool ssmi_revocation_ray_evidence_enabled_ = false;
+  bool two_layer_angular_clearing_enabled_ = false;
   int ssmi_revocation_ray_point_stride_ = 2;
   TerrainHeightCostConfig terrain_height_cost_config_;
   TerrainBoundaryFilterConfig terrain_boundary_filter_config_;
@@ -3106,6 +3319,8 @@ private:
   double local_box_max_y_ = 12.0;
   double local_box_min_z_ = -2.0;
   double local_box_max_z_ = 4.0;
+  double two_layer_angular_resolution_deg_ = 5.0;
+  double two_layer_octomap_resolution_ = 0.40;
   bool robot_body_exclusion_enabled_ = false;
   double robot_body_exclusion_min_x_ = -0.5;
   double robot_body_exclusion_max_x_ = 0.3;
@@ -3128,6 +3343,7 @@ private:
   bool have_initial_reference_ = false;
   AdmissionFrameResult latest_admission_result_;
   std::unordered_set<VoxelKey, VoxelKeyHash> pending_ray_free_evidence_;
+  TwoLayerClearingResult latest_two_layer_clearing_result_;
   std::mutex snapshot_mutex_;
   sensor_msgs::PointCloud2 voxel_cloud_snapshot_;
   bool have_voxel_cloud_snapshot_ = false;
@@ -3141,6 +3357,9 @@ private:
   double timing_callback_total_sum_ms_ = 0.0;
   double timing_callback_total_min_ms_ = std::numeric_limits<double>::max();
   double timing_callback_total_max_ms_ = 0.0;
+  double timing_two_layer_sum_ms_ = 0.0;
+  double timing_two_layer_min_ms_ = std::numeric_limits<double>::max();
+  double timing_two_layer_max_ms_ = 0.0;
   double timing_source_to_publish_sum_ms_ = 0.0;
   double timing_source_to_publish_min_ms_ = std::numeric_limits<double>::max();
   double timing_source_to_publish_max_ms_ =

@@ -149,6 +149,51 @@ TEST(ObstacleRevocation, ConsecutiveLowCostTerrainRevokesOldObstacle)
             result.revoked_free.front().key);
 }
 
+TEST(ObstacleRevocation, MeasuredLowCostUnclassifiedRevokesGeometryObstacle)
+{
+  map::ObstacleRevocationConfig config;
+  config.minimum_free_frames = 2u;
+  config.minimum_free_evidence = 2.0;
+  config.minimum_free_duration = 0.1;
+  config.voxel_size = 0.40;
+  map::ObstacleRevocationTracker tracker(config);
+  const std::unordered_set<map::VoxelKey, map::VoxelKeyHash> no_rays;
+
+  map::VoxelSnapshot missing_geometry = voxelSnapshot(
+    10, 0, 0, map::kInvalidSemanticLabel, 1.0f, false);
+  missing_geometry.last_observed = stamp(1.0);
+  tracker.update({missing_geometry}, no_rays, stamp(1.0));
+  ASSERT_EQ(1u, tracker.trackedCount());
+
+  map::VoxelSnapshot measured_free = voxelSnapshot(
+    10, 0, 0, map::kInvalidSemanticLabel, 0.20f, true);
+  measured_free.last_observed = stamp(1.1);
+  EXPECT_TRUE(tracker.update({measured_free}, no_rays, stamp(1.1))
+                .revoked_free.empty());
+  measured_free.last_observed = stamp(1.2);
+  EXPECT_EQ(1u, tracker.update({measured_free}, no_rays, stamp(1.2))
+                  .revoked_free.size());
+  EXPECT_EQ(0u, tracker.trackedCount());
+}
+
+TEST(ObstacleRevocation, MissingCostNeverCountsAsUnclassifiedFreeEvidence)
+{
+  map::ObstacleRevocationConfig config;
+  config.minimum_free_frames = 1u;
+  config.minimum_free_duration = 0.0;
+  map::ObstacleRevocationTracker tracker(config);
+  const std::unordered_set<map::VoxelKey, map::VoxelKeyHash> no_rays;
+
+  map::VoxelSnapshot obstacle = voxelSnapshot(
+    10, 0, 0, map::kInvalidSemanticLabel, 1.0f, false);
+  obstacle.last_observed = stamp(1.0);
+  tracker.update({obstacle}, no_rays, stamp(1.0));
+  obstacle.last_observed = stamp(1.1);
+  EXPECT_TRUE(tracker.update({obstacle}, no_rays, stamp(1.1))
+                .revoked_free.empty());
+  EXPECT_EQ(1u, tracker.trackedCount());
+}
+
 TEST(ObstacleRevocation, DynamicOcclusionBreaksFreeContradiction)
 {
   map::ObstacleRevocationConfig config;
@@ -1338,6 +1383,29 @@ TEST(SemanticVoxelMap, CostOnlyObservationCreatesVoxel)
   EXPECT_FLOAT_EQ(0.8f, voxels.front().traversability_cost);
   EXPECT_EQ(0u, voxels.front().semantic_observation_count);
   EXPECT_EQ(1u, voxels.front().traversability_observation_count);
+}
+
+TEST(SemanticVoxelMap, RetainedUnclassifiedMissingCostIsConservativeNotMeasured)
+{
+  map::SemanticVoxelMapConfig config;
+  config.decay_seconds = -1.0;
+  config.unknown_cost = 0.5f;
+  config.missing_traversability_cost = 1.0f;
+  map::SemanticVoxelMap voxel_map(config);
+
+  map::VoxelObservation observation;
+  observation.retain_unclassified = true;
+  observation.stamp.fromSec(21.0);
+  voxel_map.integrate(1.0, 2.0, 3.0, observation);
+
+  const auto voxels = voxel_map.snapshot();
+  ASSERT_EQ(1u, voxels.size());
+  EXPECT_EQ(map::kInvalidSemanticLabel, voxels.front().label);
+  EXPECT_FALSE(voxels.front().has_measured_traversability);
+  EXPECT_FLOAT_EQ(1.0f, voxels.front().traversability_cost);
+  EXPECT_EQ(1u, voxels.front().observation_count);
+  EXPECT_EQ(0u, voxels.front().semantic_observation_count);
+  EXPECT_EQ(0u, voxels.front().traversability_observation_count);
 }
 
 TEST(SemanticVoxelMap, MaximumFusionKeepsSaferCost)

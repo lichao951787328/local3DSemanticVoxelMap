@@ -49,6 +49,7 @@ add_library(semantic_voxel_map
   src/semantic_voxel_map.cpp
   src/ssmi_semantic_encoding.cpp
   src/terrain_boundary_filter.cpp
+  src/two_layer_angular_clearing.cpp
 )
 target_link_libraries(semantic_voxel_map ${catkin_LIBRARIES} ${OpenCV_LIBRARIES})
 add_dependencies(semantic_voxel_map ${catkin_EXPORTED_TARGETS})
@@ -81,6 +82,12 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(test_semantic_voxel_map test/test_semantic_voxel_map.cpp)
   if(TARGET test_semantic_voxel_map)
     target_link_libraries(test_semantic_voxel_map semantic_voxel_map ${catkin_LIBRARIES})
+  endif()
+  catkin_add_gtest(test_two_layer_angular_clearing
+    test/test_two_layer_angular_clearing.cpp)
+  if(TARGET test_two_layer_angular_clearing)
+    target_link_libraries(test_two_layer_angular_clearing
+      semantic_voxel_map ${catkin_LIBRARIES})
   endif()
 endif()
 

@@ -28,6 +28,10 @@ struct ObstacleRevocationConfig
   float free_max_traversability = 0.45f;
   float obstacle_min_traversability = 0.75f;
   float minimum_semantic_confidence = 0.60f;
+  // A fresh, genuinely measured low-cost observation can clear a previously
+  // published geometry-only obstacle even when semantics are still absent.
+  // Missing traversability is never treated as free evidence.
+  bool allow_unclassified_geometry_free_evidence = true;
   double ray_endpoint_margin = 0.20;
   // Defaults preserve the original Cityscapes contract. Dataset-specific
   // pipelines may override these roles (for example obstacle 0 and terrain
@@ -110,6 +114,7 @@ private:
   };
 
   bool isDynamic(std::uint32_t label) const;
+  bool isUnclassified(std::uint32_t label) const;
   bool isTerrain(std::uint32_t label) const;
   bool isSemanticObstacle(std::uint32_t label) const;
   bool isAmbiguousObstacle(std::uint32_t label) const;

@@ -60,6 +60,10 @@ struct SemanticVoxelMapConfig
   double decay_seconds = 0.5;
   std::size_t max_voxels = 500000;
   float unknown_cost = 0.5f;
+  // Conservative navigation cost for an unclassified spatial return that has
+  // no measured traversability. Keep this separate from unknown_cost, which
+  // is the probability mass prior used by semantic fusion.
+  float missing_traversability_cost = 1.0f;
   float semantic_cost_weight = 0.8f;
   // Strength of the one-way semantic risk correction. The actual correction
   // is also scaled by the dominant semantic probability of each voxel.
@@ -77,6 +81,10 @@ struct VoxelObservation
   float semantic_confidence = 1.0f;
   bool has_traversability_cost = false;
   float traversability_cost = 0.5f;
+  // Preserve a finite XYZ return even when it supplies neither semantic nor
+  // traversability evidence. Its provenance remains explicit: it does not
+  // masquerade as a measured cost.
+  bool retain_unclassified = false;
   ros::Time stamp;
 };
 
